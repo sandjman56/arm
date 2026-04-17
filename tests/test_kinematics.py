@@ -71,3 +71,28 @@ def test_inverse_rejects_point_below_base():
     """The arc can't reach z < 0 (modeled trunk only tilts up to 90 deg)."""
     with pytest.raises(Unreachable):
         inverse_kinematics((10.0, 0.0, -5.0))
+
+
+from kinematics import is_reachable
+
+
+def test_reachable_target_inside_workspace():
+    # L_min=100, L_max=300, theta_max=60deg. Point straight up at z=150 is reachable.
+    assert is_reachable((0.0, 0.0, 150.0), L_min=100, L_max=300, theta_max=math.radians(60))
+
+
+def test_unreachable_too_far():
+    assert not is_reachable((0.0, 0.0, 1000.0), L_min=100, L_max=300, theta_max=math.radians(60))
+
+
+def test_unreachable_too_close():
+    assert not is_reachable((0.0, 0.0, 50.0), L_min=100, L_max=300, theta_max=math.radians(60))
+
+
+def test_unreachable_theta_exceeded():
+    # A target far out horizontally needs theta > theta_max.
+    assert not is_reachable((200.0, 0.0, 10.0), L_min=100, L_max=300, theta_max=math.radians(30))
+
+
+def test_unreachable_below_base():
+    assert not is_reachable((10.0, 0.0, -5.0), L_min=100, L_max=300, theta_max=math.radians(60))

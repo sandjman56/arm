@@ -64,3 +64,16 @@ def inverse_kinematics(target: Vec3) -> Tuple[float, float, float]:
     theta = math.asin(sin_t)
     L = R * theta
     return (L, theta, phi)
+
+
+def is_reachable(target: Vec3, L_min: float, L_max: float, theta_max: float) -> bool:
+    """Check whether target is inside the PCC reachable workspace."""
+    try:
+        L, theta, _phi = inverse_kinematics(target)
+    except Unreachable:
+        return False
+    if not (L_min <= L <= L_max):
+        return False
+    if not (0.0 <= theta <= theta_max):
+        return False
+    return True
