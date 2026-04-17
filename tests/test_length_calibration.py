@@ -30,3 +30,29 @@ def test_save_load_roundtrip(tmp_path):
     assert loaded.is_default is False
     assert loaded.modules[1]["rest_length_mm"] == 42.0
     assert loaded.missing_modules == [5, 6]
+
+
+from length_calibration import fit_module_curve
+
+
+def test_fit_module_curve_recovers_linear_samples():
+    # Synthetic: length = 40 + 5*psi, no curvature
+    samples = [(0.0, 40.0), (2.0, 50.0), (4.0, 60.0), (6.0, 70.0), (8.0, 80.0)]
+    coeffs = fit_module_curve(samples)
+    assert coeffs[0] == pytest.approx(40.0, abs=1e-6)
+    assert coeffs[1] == pytest.approx(5.0, abs=1e-6)
+    assert coeffs[2] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_fit_module_curve_recovers_quadratic_samples():
+    # length = 40 + 3*psi + 0.1*psi^2
+    samples = [(psi, 40 + 3 * psi + 0.1 * psi * psi) for psi in (0, 2, 4, 6, 8)]
+    coeffs = fit_module_curve(samples)
+    assert coeffs[0] == pytest.approx(40.0, abs=1e-6)
+    assert coeffs[1] == pytest.approx(3.0, abs=1e-6)
+    assert coeffs[2] == pytest.approx(0.1, abs=1e-6)
+
+
+def test_fit_module_curve_requires_at_least_three_samples():
+    with pytest.raises(ValueError):
+        fit_module_curve([(0.0, 40.0), (8.0, 80.0)])
