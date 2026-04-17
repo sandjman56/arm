@@ -85,6 +85,9 @@ class ExperimentPanel(tk.Frame):
         self.xz_picker = XZPicker(self.canvas_row, L_rest=240.0, L_max=480.0)
         self.xz_picker.pack(side="left", padx=4)
         self.xz_picker.bind_pick(self._on_xz_click)
+        from panels.experiment_preview import TrunkPreview3D
+        self.preview3d = TrunkPreview3D(self.canvas_row, L_max=480.0)
+        self.preview3d.pack(side="left", padx=4, fill="both", expand=True)
 
         # Target entry row.
         tgt_row = tk.Frame(self, bg=BG_PANEL)
