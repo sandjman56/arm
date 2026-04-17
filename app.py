@@ -758,10 +758,10 @@ class ArmUI:
                     if self.experiment_controller.last_result else ""
                 ),
             )
-            # Arc points in DISPLAY frame (subtract L_rest from Z) so pickers render correctly.
+            # Pass tip in display frame (picker rendering) and arc in physics
+            # frame (preview rendering). Panel handles the frame split.
             arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
-            arc_pts_disp = [(p[0], p[1], p[2] - self.length_cal.L_rest) for p in arc_pts_base]
-            self.experiment_panel.set_tip_position(tip_zero, arc_pts_disp)
+            self.experiment_panel.set_tip_position(tip_zero, arc_pts_base)
         except Exception as e:
             # Keep the main loop alive even if the experiment panel breaks.
             print(f"[WARN] experiment tick failed: {e}")

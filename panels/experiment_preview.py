@@ -16,7 +16,8 @@ class TrunkPreview3D(tk.Frame):
         super().__init__(parent, **kwargs)
         self._L_max = L_max
         self._theta_max = theta_max
-        self._fig = Figure(figsize=(2.8, 2.8), dpi=100)
+        # Smaller figsize so the canvas can shrink with the window.
+        self._fig = Figure(figsize=(2.4, 2.4), dpi=100)
         self._ax = self._fig.add_subplot(111, projection="3d")
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
@@ -56,8 +57,8 @@ class TrunkPreview3D(tk.Frame):
             ax.plot(xs, ys, zs, color="#0aa", linewidth=2)
         # Tip marker.
         ax.scatter([self._tip[0]], [self._tip[1]], [self._tip[2]], color="#0aa", s=40)
-        # Target marker.
+        # Target marker (red dot to match the 2D pickers).
         if self._target is not None:
             ax.scatter([self._target[0]], [self._target[1]], [self._target[2]],
-                       color="#f80", s=60, marker="+")
+                       color="red", s=70, marker="o", edgecolors="red")
         self._canvas.draw_idle()
