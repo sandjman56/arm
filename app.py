@@ -507,6 +507,21 @@ class ArmUI:
         self.experiment_controller.emergency_stop()
         self.experiment_panel.set_status("EMERGENCY STOP")
 
+    def _yaw_drift_deg_per_min(self, current_yaw_rad: float) -> float:
+        """Estimate yaw drift over the last ~60s as degrees per minute."""
+        import math as _m
+        import time as _t
+        now = _t.monotonic()
+        self._yaw_history.append((now, current_yaw_rad))
+        if len(self._yaw_history) < 2:
+            return 0.0
+        t0, y0 = self._yaw_history[0]
+        dt = now - t0
+        if dt < 5.0:
+            return 0.0
+        drift_rad_per_s = (current_yaw_rad - y0) / dt
+        return _m.degrees(drift_rad_per_s) * 60.0
+
     # ===========================
     # PID CONTROL
     # ===========================
@@ -705,10 +720,51 @@ class ArmUI:
             else:
                 self.status.set(line)
 
+            # Route telemetry into the experiments backend when in live mode.
+            if not self.experiment_backend.is_sim:
+                try:
+                    self.experiment_backend.ingest_serial_line(line)
+                except Exception as e:
+                    print(f"[WARN] experiment backend ingest failed: {e}")
+
         try:
             self.graph.draw(self.modules, self.pid_active, self.pid_setpoint_psi)
         except Exception as e:
             print(f"[GRAPH ERROR] {e}")
+
+        # Advance experiment controller ~10Hz (matches update_loop cadence).
+        try:
+            self.experiment_controller.tick(dt=0.1)
+            # Push readouts to the panel - in DISPLAY frame for the pickers,
+            # in both frames for the readout labels.
+            s = self.experiment_backend.read_state()
+            import math as _m
+            from kinematics import forward_kinematics
+            theta_now = _m.hypot(s.pitch, s.roll)
+            phi_now = _m.atan2(s.roll, s.pitch) if theta_now > 1e-9 else 0.0
+            tip_base = forward_kinematics(s.total_length_mm, theta_now, phi_now)
+            tip_zero = (tip_base[0], tip_base[1], tip_base[2] - self.length_cal.L_rest)
+            yaw_drift = self._yaw_drift_deg_per_min(s.yaw)
+            self.experiment_panel.set_readouts(
+                tip_from_zero=tip_zero,
+                tip_from_base=tip_base,
+                pitch=s.pitch, roll=s.roll, yaw=s.yaw,
+                yaw_drift_deg_per_min=yaw_drift,
+                phase=self.experiment_controller.state.value,
+                error_text=(
+                    f"err {_m.degrees(self.experiment_controller.last_result.final_pitch_err_rad):.1f}° / "
+                    f"{self.experiment_controller.last_result.final_position_err_mm:.1f}mm  "
+                    f"in {self.experiment_controller.last_result.elapsed_s:.1f}s"
+                    if self.experiment_controller.last_result else ""
+                ),
+            )
+            # Arc points in DISPLAY frame (subtract L_rest from Z) so pickers render correctly.
+            arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
+            arc_pts_disp = [(p[0], p[1], p[2] - self.length_cal.L_rest) for p in arc_pts_base]
+            self.experiment_panel.set_tip_position(tip_zero, arc_pts_disp)
+        except Exception as e:
+            # Keep the main loop alive even if the experiment panel breaks.
+            print(f"[WARN] experiment tick failed: {e}")
 
         self.root.after(100, self.update_loop)
 
@@ -735,3 +791,9 @@ class ArmUI:
             pass
         self.arduino.close()
         self.root.destroy()
+
+
+def _sample_arc_points(L: float, theta: float, phi: float, n: int = 20):
+    """Sample n+1 points along the PCC arc from base to tip."""
+    from kinematics import forward_kinematics
+    return [forward_kinematics(L * i / n, theta * i / n, phi) for i in range(n + 1)]
