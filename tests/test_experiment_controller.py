@@ -81,3 +81,31 @@ def test_elongating_times_out(ctrl):
     ctrl._phase_start = time.monotonic() - (ctrl.ELONGATION_TIMEOUT_S + 1)
     ctrl.tick(dt=0.05)
     assert ctrl.state == State.TIMED_OUT
+
+
+def test_bending_reaches_on_tolerance(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 300.0))  # straight up — theta_target = 0
+    # Straight-up target has zero orientation error; after elongation finishes,
+    # one bending tick should declare REACHED.
+    for _ in range(400):
+        ctrl.tick(dt=0.05)
+        if ctrl.state in (State.REACHED, State.TIMED_OUT):
+            break
+    assert ctrl.state == State.REACHED
+    assert ctrl.last_result is not None
+    assert ctrl.last_result.timed_out is False
+
+
+def test_bending_commands_tendons_for_off_axis_target(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    # Target that needs pitch bending.
+    ctrl.reach(target=(100.0, 0.0, 260.0))
+    for _ in range(400):
+        ctrl.tick(dt=0.05)
+        if ctrl.state in (State.REACHED, State.TIMED_OUT):
+            break
+    # SimBackend slews to match; should converge within budget.
+    assert ctrl.state == State.REACHED

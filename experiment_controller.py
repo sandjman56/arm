@@ -148,8 +148,53 @@ class ExperimentController:
         self.state = State.TIMED_OUT if timed_out else State.REACHED
 
     def _tick_bending(self) -> None:
-        # Placeholder — will be filled in Task 15.
-        pass
+        elapsed = time.monotonic() - self._phase_start
+        pitch, roll, _yaw = self.backend.read_orientation()
+
+        target_pitch = self._theta_target * math.cos(self._phi_target)
+        target_roll = self._theta_target * math.sin(self._phi_target)
+
+        err_pitch = target_pitch - pitch
+        err_roll = target_roll - roll
+
+        # Position error check (kinematic).
+        from kinematics import forward_kinematics
+        s = self.backend.read_state()
+        theta_now = math.hypot(pitch, roll)
+        phi_now = math.atan2(roll, pitch) if theta_now > 1e-9 else 0.0
+        tip = forward_kinematics(s.total_length_mm, theta_now, phi_now)
+        tx, ty, tz = self._target
+        pos_err = math.sqrt((tip[0] - tx) ** 2 + (tip[1] - ty) ** 2 + (tip[2] - tz) ** 2)
+        ang_err = math.hypot(err_pitch, err_roll)
+
+        if ang_err < self.TOL_ANGLE_RAD and pos_err < self.TOL_POS_MM:
+            # Halt tendons and declare REACHED.
+            for sid in (1, 2, 3, 4):
+                self.backend.set_tendon_rate(sid, 0.0)
+            self._finish(timed_out=False)
+            return
+
+        if elapsed > self.BEND_TIMEOUT_S:
+            for sid in (1, 2, 3, 4):
+                self.backend.set_tendon_rate(sid, 0.0)
+            self._finish(timed_out=True)
+            return
+
+        # 4-tendon antagonistic mapping:
+        # servo 1 at 0 deg  winds to pull +pitch
+        # servo 3 at 180 deg winds to pull -pitch
+        # servo 2 at 90 deg winds to pull +roll
+        # servo 4 at 270 deg winds to pull -roll
+        u_pitch = self.KP_BEND * err_pitch
+        u_roll = self.KP_BEND * err_roll
+        rate_1 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_pitch))
+        rate_3 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_pitch))
+        rate_2 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_roll))
+        rate_4 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_roll))
+        self.backend.set_tendon_rate(1, rate_1)
+        self.backend.set_tendon_rate(2, rate_2)
+        self.backend.set_tendon_rate(3, rate_3)
+        self.backend.set_tendon_rate(4, rate_4)
 
     def _command_module_pressures_for_length(self, L_total: float) -> None:
         """Solve per-module pressures that sum to L_total using calibration curves.
