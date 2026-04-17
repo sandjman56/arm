@@ -166,3 +166,91 @@ def _slew(current: float, target: float, max_step: float) -> float:
     if abs(diff) <= max_step:
         return target
     return current + math.copysign(max_step, diff)
+
+
+import time
+from orientation import OrientationEstimator
+from arduino_interface import fmt_set_module, fmt_tendon
+
+
+class LiveBackend(Backend):
+    """Backend that drives the real rig over serial.
+
+    Ingests IMU,* and PM,* telemetry lines via `ingest_serial_line()` (the
+    main app's reader routes these in). Outgoing commands go through the
+    injected arduino-like object.
+    """
+    IMU_FRESH_WINDOW_S = 1.0
+
+    def __init__(self, arduino, num_modules: int):
+        self._arduino = arduino
+        self._num_modules = num_modules
+        self._pressures: Dict[int, float] = {i + 1: 0.0 for i in range(num_modules)}
+        self._last_imu_t: float = 0.0
+        self._orient = OrientationEstimator()
+        self._length_mm = 0.0
+        self._halted = False
+
+    @property
+    def is_sim(self) -> bool:
+        return False
+
+    def ingest_serial_line(self, line: str) -> None:
+        """Process one already-decoded serial line from the arduino reader."""
+        if line.startswith("IMU,"):
+            parts = line.split(",")
+            if len(parts) >= 9:
+                try:
+                    ax, ay, az = float(parts[2]), float(parts[3]), float(parts[4])
+                    gx, gy, gz = float(parts[5]), float(parts[6]), float(parts[7])
+                    self._orient.update_accel(ax, ay, az)
+                    self._orient.update_gyro(gx, gy, gz)
+                    self._last_imu_t = time.monotonic()
+                except (ValueError, IndexError):
+                    pass
+        elif line.startswith("PM,"):
+            parts = line.split(",")
+            if len(parts) >= 5:
+                try:
+                    mod_id = int(parts[1])
+                    psi = float(parts[4])
+                    self._pressures[mod_id] = psi
+                except (ValueError, IndexError):
+                    pass
+
+    def set_module_pressure(self, module_id: int, target_psi: float) -> None:
+        hpa = target_psi / 0.0145038
+        self._arduino.send(fmt_set_module(module_id, hpa))
+
+    def set_tendon_rate(self, servo_id: int, rate: float) -> None:
+        self._arduino.send(fmt_tendon(servo_id, rate))
+
+    def capture_zero(self) -> None:
+        self._orient.capture_zero()
+
+    def emergency_stop(self) -> None:
+        self._halted = True
+        self._arduino.send("STOP")
+
+    def tick(self, dt: float) -> None:
+        # Live backend has no internal time-advance; it reacts to serial.
+        pass
+
+    def read_state(self) -> BackendState:
+        pitch, roll, yaw = self._orient.from_zero()
+        imu_fresh = (time.monotonic() - self._last_imu_t) < self.IMU_FRESH_WINDOW_S
+        return BackendState(
+            total_length_mm=self._length_mm,  # set externally via calibration + pressures
+            module_pressures_psi=dict(self._pressures),
+            pitch=pitch,
+            roll=roll,
+            yaw=yaw,
+            imu_fresh=imu_fresh,
+        )
+
+    def read_orientation(self) -> tuple[float, float, float]:
+        return self._orient.from_zero()
+
+    def set_total_length_mm(self, L_mm: float) -> None:
+        """Updated from outside (by the controller) based on calibration+pressures."""
+        self._length_mm = L_mm
