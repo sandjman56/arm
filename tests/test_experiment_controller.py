@@ -37,3 +37,25 @@ def test_estop_from_any_state_returns_to_IDLE(ctrl):
     ctrl.start_zeroing()
     ctrl.emergency_stop()
     assert ctrl.state == State.IDLE
+
+
+def test_reach_requires_WAITING_state(ctrl):
+    # Still in IDLE — reach should be a no-op.
+    ctrl.reach(target=(0.0, 0.0, 300.0))
+    assert ctrl.state == State.IDLE
+
+
+def test_reach_transitions_to_ELONGATING_with_valid_target(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 300.0))  # reachable straight-up
+    assert ctrl.state == State.ELONGATING
+
+
+def test_reach_rejects_unreachable_target(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    # Far-out target that needs theta > 60 deg.
+    with pytest.raises(ValueError):
+        ctrl.reach(target=(10000.0, 0.0, 10.0))
+    assert ctrl.state == State.WAITING_FOR_TARGET
