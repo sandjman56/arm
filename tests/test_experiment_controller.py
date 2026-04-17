@@ -59,3 +59,25 @@ def test_reach_rejects_unreachable_target(ctrl):
     with pytest.raises(ValueError):
         ctrl.reach(target=(10000.0, 0.0, 10.0))
     assert ctrl.state == State.WAITING_FOR_TARGET
+
+
+def test_elongating_transitions_to_bending_when_length_reached(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 300.0))
+    # Advance enough ticks for SimBackend to reach the length.
+    for _ in range(200):
+        ctrl.tick(dt=0.05)
+        if ctrl.state == State.BENDING:
+            break
+    assert ctrl.state == State.BENDING
+
+
+def test_elongating_times_out(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 300.0))
+    # Force a timeout by stubbing the clock.
+    ctrl._phase_start = time.monotonic() - (ctrl.ELONGATION_TIMEOUT_S + 1)
+    ctrl.tick(dt=0.05)
+    assert ctrl.state == State.TIMED_OUT

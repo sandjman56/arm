@@ -89,6 +89,68 @@ class ExperimentController:
             self.backend.set_total_length_target(L_target)
         self.state = State.ELONGATING
 
+    # --- Main tick ---------------------------------------------------------
+
+    def tick(self, dt: float) -> None:
+        """Advance the controller by dt seconds. Called ~20 Hz from the UI."""
+        # Always let the backend advance first.
+        self.backend.tick(dt)
+
+        if self.state == State.ELONGATING:
+            self._tick_elongating()
+        elif self.state == State.BENDING:
+            self._tick_bending()
+
+    def _tick_elongating(self) -> None:
+        s = self.backend.read_state()
+        elapsed = time.monotonic() - self._phase_start
+        # Convergence: SimBackend length near target, or pressures near setpoints.
+        if abs(s.total_length_mm - self._L_target) < 5.0:
+            # Move on to bending phase.
+            self._phase_start = time.monotonic()
+            # Command orientation target for sim; the real backend sees commands
+            # via set_tendon_rate() during _tick_bending.
+            if hasattr(self.backend, "set_orientation_target"):
+                # Convert target direction into pitch/roll (roll=0, pitch=theta in bend plane).
+                # For sim: project into pitch/roll according to phi.
+                target_pitch = self._theta_target * math.cos(self._phi_target)
+                target_roll = self._theta_target * math.sin(self._phi_target)
+                self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
+            self.state = State.BENDING
+            return
+        if elapsed > self.ELONGATION_TIMEOUT_S:
+            self._finish(timed_out=True)
+
+    def _finish(self, timed_out: bool) -> None:
+        elapsed = time.monotonic() - self._phase_start
+        pitch, roll, _yaw = self.backend.read_orientation()
+        # Angular error: angle between current tilt vector and target tilt vector.
+        cur_pitch = pitch
+        cur_roll = roll
+        target_pitch = self._theta_target * math.cos(self._phi_target)
+        target_roll = self._theta_target * math.sin(self._phi_target)
+        # Simple 2D error norm:
+        ang_err = math.hypot(cur_pitch - target_pitch, cur_roll - target_roll)
+        # Position error: forward kinematics from current state.
+        from kinematics import forward_kinematics
+        s = self.backend.read_state()
+        theta_now = math.hypot(cur_pitch, cur_roll)
+        phi_now = math.atan2(cur_roll, cur_pitch) if theta_now > 1e-9 else 0.0
+        tip = forward_kinematics(s.total_length_mm, theta_now, phi_now)
+        tx, ty, tz = self._target or (0, 0, 0)
+        pos_err = math.sqrt((tip[0] - tx) ** 2 + (tip[1] - ty) ** 2 + (tip[2] - tz) ** 2)
+        self._last_result = RunResult(
+            final_pitch_err_rad=ang_err,
+            final_position_err_mm=pos_err,
+            elapsed_s=elapsed,
+            timed_out=timed_out,
+        )
+        self.state = State.TIMED_OUT if timed_out else State.REACHED
+
+    def _tick_bending(self) -> None:
+        # Placeholder — will be filled in Task 15.
+        pass
+
     def _command_module_pressures_for_length(self, L_total: float) -> None:
         """Solve per-module pressures that sum to L_total using calibration curves.
 
