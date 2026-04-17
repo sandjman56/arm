@@ -148,6 +148,11 @@ class ExperimentController:
         self.state = State.TIMED_OUT if timed_out else State.REACHED
 
     def _tick_bending(self) -> None:
+        s = self.backend.read_state()
+        # Live-mode IMU-staleness watchdog (spec §8). SimBackend reports fresh.
+        if not self.backend.is_sim and not s.imu_fresh:
+            self.emergency_stop()
+            return
         elapsed = time.monotonic() - self._phase_start
         pitch, roll, _yaw = self.backend.read_orientation()
 
@@ -159,7 +164,6 @@ class ExperimentController:
 
         # Position error check (kinematic).
         from kinematics import forward_kinematics
-        s = self.backend.read_state()
         theta_now = math.hypot(pitch, roll)
         phi_now = math.atan2(roll, pitch) if theta_now > 1e-9 else 0.0
         tip = forward_kinematics(s.total_length_mm, theta_now, phi_now)
