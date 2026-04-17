@@ -195,6 +195,11 @@ struct Module {
   long minStepLimit;
   long maxStepLimit;
   bool limitsActive;
+  // Non-blocking step state
+  int  stepsRemaining;
+  int  stepDirSign;      // +1 (CW) or -1 (CCW)
+  bool stepHigh;         // true = pin currently HIGH (mid-step)
+  unsigned long lastStepUs;
 };
 
 Module modules[MAX_MODULES];
@@ -263,13 +268,17 @@ unsigned long lastPIDTime = 0;
 // Helper: initialize a module slot
 // =========================
 void initModule(int idx, int stepPin, int dirPin) {
-  modules[idx].stepPin      = stepPin;
-  modules[idx].dirPin       = dirPin;
-  modules[idx].active       = true;
-  modules[idx].stepPosition = 0;
-  modules[idx].minStepLimit = -999999L;
-  modules[idx].maxStepLimit = 999999L;
-  modules[idx].limitsActive = false;
+  modules[idx].stepPin       = stepPin;
+  modules[idx].dirPin        = dirPin;
+  modules[idx].active        = true;
+  modules[idx].stepPosition  = 0;
+  modules[idx].minStepLimit  = -999999L;
+  modules[idx].maxStepLimit  = 999999L;
+  modules[idx].limitsActive  = false;
+  modules[idx].stepsRemaining = 0;
+  modules[idx].stepDirSign   = 1;
+  modules[idx].stepHigh      = false;
+  modules[idx].lastStepUs    = 0;
 
   // Per-module PID state.
   currentPressureM[idx] = 0.0;
@@ -312,6 +321,7 @@ void setup() {
   // Initialize I2C bus
   Wire.begin();
   Wire.setClock(400000);  // 400kHz fast mode
+  Wire.setWireTimeout(3000, true);  // 3ms I2C timeout; auto-resets bus on lockup
   delay(50);
 
   // Verify mux is responding
@@ -358,37 +368,67 @@ void setup() {
 }
 
 // =========================
-// Stepper burst for a specific module (with position tracking & limits)
+// Stepper burst for a specific module — non-blocking.
+// Queues BURST_STEPS steps; loop() drains them via runSteppers().
 // =========================
 void stepBurstModule(int idx, int dir) {
   if (idx < 0 || idx >= moduleCount || !modules[idx].active) return;
 
   Module &m = modules[idx];
+  int dirSign = (dir == DIR_CW) ? 1 : -1;
+
+  // Check first step against limits before queuing.
+  if (m.limitsActive) {
+    long nextPos = m.stepPosition + dirSign;
+    if (nextPos < m.minStepLimit || nextPos > m.maxStepLimit) {
+      Serial.print("LIMIT_HIT ");
+      Serial.print(idx + 1);
+      Serial.print(",");
+      Serial.println(m.stepPosition);
+      return;
+    }
+  }
+
   digitalWrite(m.dirPin, dir);
+  m.stepDirSign    = dirSign;
+  m.stepsRemaining = BURST_STEPS;
+  m.stepHigh       = false;
+  m.lastStepUs     = 0;  // fire on next runSteppers() call
+}
 
-  int stepDir = (dir == DIR_CW) ? 1 : -1;
+// =========================
+// Non-blocking step driver — call once per loop() iteration.
+// Toggles step pins at STEP_DELAY_US intervals without blocking.
+// =========================
+void runSteppers() {
+  unsigned long nowUs = micros();
+  for (int i = 0; i < moduleCount; i++) {
+    Module &m = modules[i];
+    if (!m.active || m.stepsRemaining <= 0) continue;
+    if ((unsigned long)(nowUs - m.lastStepUs) < (unsigned long)STEP_DELAY_US) continue;
 
-  for (int i = 0; i < BURST_STEPS; i++) {
-    long nextPos = m.stepPosition + stepDir;
+    m.lastStepUs = nowUs;
 
-    if (m.limitsActive) {
-      if (nextPos < m.minStepLimit || nextPos > m.maxStepLimit) {
-        if (i == 0) {
-          Serial.print("LIMIT_HIT ");
-          Serial.print(idx + 1);
-          Serial.print(",");
-          Serial.println(m.stepPosition);
-        }
-        break;
+    if (m.stepHigh) {
+      // Falling edge — step completes, advance position.
+      digitalWrite(m.stepPin, LOW);
+      m.stepHigh = false;
+      m.stepPosition += m.stepDirSign;
+      m.stepsRemaining--;
+    } else {
+      // Rising edge — check limit before committing.
+      long nextPos = m.stepPosition + m.stepDirSign;
+      if (m.limitsActive && (nextPos < m.minStepLimit || nextPos > m.maxStepLimit)) {
+        Serial.print("LIMIT_HIT ");
+        Serial.print(i + 1);
+        Serial.print(",");
+        Serial.println(m.stepPosition);
+        m.stepsRemaining = 0;
+      } else {
+        digitalWrite(m.stepPin, HIGH);
+        m.stepHigh = true;
       }
     }
-
-    digitalWrite(m.stepPin, HIGH);
-    delayMicroseconds(STEP_DELAY_US);
-    digitalWrite(m.stepPin, LOW);
-    delayMicroseconds(STEP_DELAY_US);
-
-    m.stepPosition = nextPos;
   }
 }
 
@@ -771,6 +811,9 @@ void handleCommand(String cmd) {
 // =========================
 void loop() {
 
+  // Non-blocking stepper driver — runs first so step timing is as tight as possible.
+  runSteppers();
+
   // =========================
   // SERIAL INPUT
   // =========================
@@ -861,6 +904,7 @@ void loop() {
     for (int i = 0; i < moduleCount; i++) {
       if (!pidEnabledM[i]) continue;
       if (!modules[i].active) continue;
+      if (modules[i].stepsRemaining > 0) continue;  // mid-burst, wait
 
       float err = setpointHpaM[i] - currentPressureM[i];
 
