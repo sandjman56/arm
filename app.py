@@ -113,18 +113,63 @@ class ArmUI:
     # UI BUILD
     # ===========================
     def build_ui(self):
+        # Scrollable content wrapper: everything below is packed into
+        # self.content_frame, which lives inside a canvas with a vertical
+        # scrollbar. This means the window can be any height and the user
+        # can still scroll to see everything.
+        self._scroll_canvas = tk.Canvas(
+            self.root, bg=BG_PRIMARY, highlightthickness=0,
+        )
+        self._scroll_bar = ttk.Scrollbar(
+            self.root, orient="vertical", command=self._scroll_canvas.yview,
+        )
+        self._scroll_canvas.configure(yscrollcommand=self._scroll_bar.set)
+        self._scroll_bar.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        self.content_frame = tk.Frame(self._scroll_canvas, bg=BG_PRIMARY)
+        self._content_window = self._scroll_canvas.create_window(
+            (0, 0), window=self.content_frame, anchor="nw",
+        )
+
+        # Keep the scroll region in sync with the content frame's size.
+        def _on_content_resize(event):
+            self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+        self.content_frame.bind("<Configure>", _on_content_resize)
+
+        # Make the inner frame always match the canvas width so children
+        # that pack fill='x' actually fill horizontally.
+        def _on_canvas_resize(event):
+            self._scroll_canvas.itemconfigure(self._content_window, width=event.width)
+        self._scroll_canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Mouse wheel / trackpad scroll. macOS sends small delta values;
+        # Linux uses Button-4/5. Windows sends delta in multiples of 120.
+        def _on_mousewheel(event):
+            # Normalize: macOS delta ~= 1 per notch, Windows delta ~= 120.
+            if abs(event.delta) >= 120:
+                step = int(-event.delta / 120)
+            else:
+                step = -event.delta
+            self._scroll_canvas.yview_scroll(step, "units")
+        self._scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._scroll_canvas.bind_all("<Button-4>",
+                                     lambda e: self._scroll_canvas.yview_scroll(-1, "units"))
+        self._scroll_canvas.bind_all("<Button-5>",
+                                     lambda e: self._scroll_canvas.yview_scroll(1, "units"))
+
         # Title bar
-        title_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        title_frame = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         title_frame.pack(fill="x", padx=20, pady=(10, 0))
 
         tk.Label(title_frame, text="CONTINUUM ARM CONTROLLER",
                 font=FONT_TITLE, fg=ACCENT_CYAN, bg=BG_PRIMARY).pack(side="left")
 
         # Thin accent line under title
-        tk.Frame(self.root, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x", padx=20, pady=(5, 0))
+        tk.Frame(self.content_frame, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x", padx=20, pady=(5, 0))
 
         # Connection frame
-        conn_frame = tk.Frame(self.root, bg=BG_PANEL)
+        conn_frame = tk.Frame(self.content_frame, bg=BG_PANEL)
         conn_frame.pack(fill="x", padx=20, pady=(8, 0))
 
         conn_inner = tk.Frame(conn_frame, bg=BG_PANEL)
@@ -163,14 +208,14 @@ class ArmUI:
                 font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="left", padx=5)
 
         # Stepper Position Bar (NEW)
-        stepper_border = tk.Frame(self.root, bg=ACCENT_CYAN_DIM, padx=1, pady=1)
+        stepper_border = tk.Frame(self.content_frame, bg=ACCENT_CYAN_DIM, padx=1, pady=1)
         stepper_border.pack(fill="x", padx=20, pady=(8, 0))
         self.stepper_bar = StepperPositionBar(stepper_border)
         self.stepper_bar.pack(fill="x")
         self.stepper_bar.rebuild(self.modules)
 
         # Pressure display
-        pressure_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        pressure_outer = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         pressure_outer.pack(fill="x", padx=20, pady=(8, 0))
 
         tk.Frame(pressure_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
@@ -182,7 +227,7 @@ class ArmUI:
         self._rebuild_pressure_display()
 
         # IMU display
-        imu_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        imu_outer = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         imu_outer.pack(fill="x", padx=20, pady=(8, 0))
 
         tk.Frame(imu_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
@@ -227,7 +272,7 @@ class ArmUI:
                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
 
         # Mode selector
-        mode_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        mode_frame = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         mode_frame.pack(fill="x", padx=20, pady=(10, 0))
 
         tk.Label(mode_frame, text="MODE:", font=FONT_BODY_BOLD,
@@ -240,7 +285,7 @@ class ArmUI:
             rb.pack(side="left", padx=10)
 
         # Panel container
-        self.panel_container = tk.Frame(self.root, bg=BG_PRIMARY)
+        self.panel_container = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         self.panel_container.pack(fill="both", expand=True, padx=20, pady=5)
 
         # Create panels
@@ -288,7 +333,7 @@ class ArmUI:
         self.burst_panel.pack(fill="both", expand=True)
 
         # Logging
-        log_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        log_frame = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         log_frame.pack(fill="x", padx=20, pady=(5, 0))
 
         tk.Frame(log_frame, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
@@ -303,7 +348,7 @@ class ArmUI:
                     command=self.stop_log).pack(side="left", padx=5)
 
         # Pressure graph
-        graph_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        graph_outer = tk.Frame(self.content_frame, bg=BG_PRIMARY)
         graph_outer.pack(fill="both", expand=True, padx=20, pady=(5, 10))
 
         tk.Frame(graph_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
