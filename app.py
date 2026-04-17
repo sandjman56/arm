@@ -70,12 +70,20 @@ class ArmUI:
             "temp": tk.StringVar(value="---"),
         }
 
-        # Module system
+        # Module system — configurable list of modules. Pin mapping reflects
+        # current wiring; modules beyond wired ones get None pins.
         self.modules = []
         self.next_module_id = 1
-        self._add_module_data("Module 1", step_pin=3, dir_pin=4)
-        self._add_module_data("Module 2", step_pin=8, dir_pin=7)
-        self._add_module_data("Module 3", step_pin=None, dir_pin=None)
+        MODULE_CONFIG = [
+            ("Module 1", 3, 4),
+            ("Module 2", 8, 7),
+            ("Module 3", None, None),
+            ("Module 4", None, None),
+            ("Module 5", None, None),
+            ("Module 6", None, None),
+        ]
+        for name, step_pin, dir_pin in MODULE_CONFIG:
+            self._add_module_data(name, step_pin=step_pin, dir_pin=dir_pin)
 
         self.build_ui()
         self.refresh_ports()
