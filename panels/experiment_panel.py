@@ -75,11 +75,13 @@ class ExperimentPanel(tk.Frame):
         tk.Label(btn_row, textvariable=self.status_var,
                  font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="right", padx=10)
 
-        # Canvas row placeholder (Tasks 18-20 replace this).
-        self.canvas_row = tk.Frame(self, bg=BG_PANEL, height=260)
+        # Canvas row.
+        from panels.experiment_pickers import XYPicker
+        self.canvas_row = tk.Frame(self, bg=BG_PANEL)
         self.canvas_row.pack(fill="x", padx=10, pady=4)
-        tk.Label(self.canvas_row, text="[XY picker]  [XZ picker]  [3D preview]",
-                 font=FONT_BODY, fg=TEXT_SECONDARY, bg=BG_PANEL).pack(pady=40)
+        self.xy_picker = XYPicker(self.canvas_row, r_max=400.0)
+        self.xy_picker.pack(side="left", padx=4)
+        self.xy_picker.bind_pick(self._on_xy_click)
 
         # Target entry row.
         tgt_row = tk.Frame(self, bg=BG_PANEL)
@@ -106,6 +108,10 @@ class ExperimentPanel(tk.Frame):
         # E-stop.
         EmergencyStopButton(self, command=self._on_emergency_stop).pack(
             fill="x", padx=10, pady=(10, 10))
+
+    def _on_xy_click(self, x: float, y: float) -> None:
+        self.target_x.set(f"{x:.1f}")
+        self.target_y.set(f"{y:.1f}")
 
     def _handle_reach(self) -> None:
         try:
