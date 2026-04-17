@@ -76,12 +76,15 @@ class ExperimentPanel(tk.Frame):
                  font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="right", padx=10)
 
         # Canvas row.
-        from panels.experiment_pickers import XYPicker
+        from panels.experiment_pickers import XYPicker, XZPicker
         self.canvas_row = tk.Frame(self, bg=BG_PANEL)
         self.canvas_row.pack(fill="x", padx=10, pady=4)
         self.xy_picker = XYPicker(self.canvas_row, r_max=400.0)
         self.xy_picker.pack(side="left", padx=4)
         self.xy_picker.bind_pick(self._on_xy_click)
+        self.xz_picker = XZPicker(self.canvas_row, L_rest=240.0, L_max=480.0)
+        self.xz_picker.pack(side="left", padx=4)
+        self.xz_picker.bind_pick(self._on_xz_click)
 
         # Target entry row.
         tgt_row = tk.Frame(self, bg=BG_PANEL)
@@ -112,6 +115,12 @@ class ExperimentPanel(tk.Frame):
     def _on_xy_click(self, x: float, y: float) -> None:
         self.target_x.set(f"{x:.1f}")
         self.target_y.set(f"{y:.1f}")
+        # Lock X on the XZ picker so clicks there stay consistent.
+        self.xz_picker.set_locked_x(x)
+
+    def _on_xz_click(self, x: float, z: float) -> None:
+        self.target_x.set(f"{x:.1f}")
+        self.target_z.set(f"{z:.1f}")
 
     def _handle_reach(self) -> None:
         try:

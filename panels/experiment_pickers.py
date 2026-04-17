@@ -108,3 +108,89 @@ def plt_circle(cx: float, cy: float, r: float, n: int = 64) -> Tuple[list, list]
         xs.append(cx + r * math.cos(t))
         ys.append(cy + r * math.sin(t))
     return xs, ys
+
+
+class XZPicker(_BasePicker):
+    """Side view XZ picker with a vertical guide line at locked X."""
+    def __init__(self, parent, L_rest: float = 240.0, L_max: float = 480.0,
+                 theta_max_rad: float = math.radians(60), **kwargs):
+        super().__init__(parent, title="XZ (side view)", **kwargs)
+        self._L_rest = L_rest
+        self._L_max = L_max
+        self._theta_max = theta_max_rad
+        self._tip_xz: Tuple[float, float] = (0.0, L_rest)
+        self._locked_x: Optional[float] = None
+        self._target_xz: Optional[Tuple[float, float]] = None
+        self._redraw()
+
+    def set_workspace(self, L_rest: float, L_max: float, theta_max_rad: float) -> None:
+        self._L_rest = L_rest
+        self._L_max = L_max
+        self._theta_max = theta_max_rad
+        self._redraw()
+
+    def set_tip(self, x: float, z: float) -> None:
+        self._tip_xz = (x, z)
+        self._redraw()
+
+    def set_locked_x(self, x: Optional[float]) -> None:
+        self._locked_x = x
+        self._redraw()
+
+    def set_target(self, x: Optional[float], z: Optional[float]) -> None:
+        self._target_xz = (x, z) if x is not None and z is not None else None
+        self._redraw()
+
+    def _is_inside(self, x: float, z: float) -> bool:
+        # Must lie inside the workspace cross-section AND on the guide line if locked.
+        if self._locked_x is not None and abs(x - self._locked_x) > 2.0:
+            return False
+        # Quick reachability check in XZ: approximate with a dome of radius L_max.
+        if z < 0:
+            return False
+        if math.hypot(x, z) > self._L_max * 1.02:
+            return False
+        return True
+
+    def _redraw(self) -> None:
+        ax = self._ax
+        ax.clear()
+        ax.set_title(self._title, fontsize=9)
+        lim = self._L_max * 1.1
+        ax.set_xlim(-lim, lim)
+        ax.set_ylim(-10, lim)
+        ax.set_aspect("equal", adjustable="box")
+        # Reachable dome cross-section: L_min inner arc, L_max outer arc.
+        inner = _dome_arc(self._L_rest, self._theta_max)
+        outer = _dome_arc(self._L_max, self._theta_max)
+        ax.plot(inner[0], inner[1], linestyle=":", color="#888")
+        ax.plot(outer[0], outer[1], linestyle="--", color="#888")
+        # Tip + guide + target.
+        ax.plot([self._tip_xz[0]], [self._tip_xz[1]], marker="o", color="#0aa")
+        if self._locked_x is not None:
+            ax.axvline(self._locked_x, color="#0aa", linewidth=0.8, linestyle="--")
+        if self._target_xz is not None:
+            ax.plot([self._target_xz[0]], [self._target_xz[1]],
+                    marker="+", color="#f80", markersize=15)
+        ax.axhline(0, color="#444", linewidth=0.5)
+        ax.axvline(0, color="#444", linewidth=0.5)
+        ax.set_xlabel("X (mm)")
+        ax.set_ylabel("Z (mm)")
+        self._canvas.draw_idle()
+
+
+def _dome_arc(L: float, theta_max: float, n: int = 40) -> Tuple[list, list]:
+    """Generate (x, z) points of a PCC arc swept from -theta_max to +theta_max."""
+    xs, zs = [], []
+    for i in range(n + 1):
+        t = -theta_max + (2 * theta_max) * i / n
+        if abs(t) < 1e-9:
+            xs.append(0.0)
+            zs.append(L)
+        else:
+            R = L / abs(t)
+            r = R * (1.0 - math.cos(t))
+            z = R * math.sin(abs(t))
+            xs.append(math.copysign(r, t))
+            zs.append(z)
+    return xs, zs
