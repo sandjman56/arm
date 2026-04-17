@@ -1,0 +1,53 @@
+# arduino_interface.py -- Serial communication with Arduino
+import time
+import serial
+
+
+class ArduinoInterface:
+    def __init__(self, baudrate=115200):
+        self.baudrate = baudrate
+        self.ser = None
+
+    def connect(self, port):
+        try:
+            self.ser = serial.Serial(port, self.baudrate, timeout=1)
+            time.sleep(2)  # allow Arduino reset
+            self.ser.reset_input_buffer()
+            print(f"[INFO] Connected to {port}")
+            return True
+        except Exception as e:
+            print("[ERROR] Connection failed:", e)
+            return False
+
+    def send(self, cmd):
+        if not self.ser or not self.ser.is_open:
+            return False
+        try:
+            print("TX:", cmd)
+            self.ser.write((cmd + "\n").encode())
+            return True
+        except (serial.SerialException, OSError) as e:
+            print(f"[ERROR] Serial write failed: {e}")
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
+            return False
+
+    def read_line(self):
+        if not self.ser:
+            return None
+        try:
+            line = self.ser.readline()
+            if line:
+                decoded = line.decode(errors="ignore").strip()
+                print("RX:", decoded)
+                return decoded
+        except:
+            return None
+        return None
+
+    def close(self):
+        if self.ser:
+            self.ser.close()

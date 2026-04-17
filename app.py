@@ -1,0 +1,615 @@
+# app.py -- Main ArmUI orchestrator
+import tkinter as tk
+from tkinter import ttk
+import threading
+import queue
+import os
+import json
+from collections import deque
+
+from theme import (
+    BG_PRIMARY, BG_PANEL, BG_INPUT, BG_HOVER, BG_BUTTON,
+    ACCENT_CYAN, ACCENT_CYAN_DIM, ACCENT_GREEN, ACCENT_RED, ACCENT_ORANGE,
+    TEXT_PRIMARY, TEXT_SECONDARY, TEXT_ACCENT,
+    MODULE_COLORS,
+    FONT_TITLE, FONT_HEADING, FONT_BODY, FONT_BODY_BOLD, FONT_BUTTON,
+    FONT_DATA, FONT_DATA_LARGE, FONT_LABEL,
+    apply_theme,
+)
+from widgets import (
+    AccentButton, StatusDot, StepperPositionBar, PressureBox,
+)
+from arduino_interface import ArduinoInterface
+from logger import CSVLogger
+from graph import PressureGraph
+from panels import BurstPanel, PIDPanel, CalibrationPanel
+
+
+class ArmUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Continuum Arm Controller")
+        self.root.geometry("1100x950")
+
+        apply_theme(root)
+
+        self.arduino = ArduinoInterface()
+        self.queue = queue.Queue()
+        self.running = True
+        self.logger = CSVLogger()
+
+        self.status = tk.StringVar(value="SELECT PORT AND CONNECT")
+        self.connection = tk.StringVar(value="Not connected")
+        self.port_var = tk.StringVar()
+        self.ports = []
+
+        # Mode state
+        self.mode = tk.StringVar(value="burst")
+        self.pid_active = False
+        self.pid_setpoint_psi = 0.0
+
+        # Graph
+        self.graph_max_points = 200
+
+        # Calibration state
+        self.step_position = 0
+        self.cal_back_wall = None
+        self.cal_front_wall = None
+        self.cal_file = os.path.join(os.path.dirname(__file__) or ".", "calibration.json")
+        self.calibration_loaded = False
+        self._load_calibration_from_disk()
+
+        # IMU state
+        self.imu_data = {
+            "ax": tk.StringVar(value="---"),
+            "ay": tk.StringVar(value="---"),
+            "az": tk.StringVar(value="---"),
+            "gx": tk.StringVar(value="---"),
+            "gy": tk.StringVar(value="---"),
+            "gz": tk.StringVar(value="---"),
+            "temp": tk.StringVar(value="---"),
+        }
+
+        # Module system
+        self.modules = []
+        self.next_module_id = 1
+        self._add_module_data("Module 1", step_pin=3, dir_pin=4)
+        self._add_module_data("Module 2", step_pin=8, dir_pin=7)
+        self._add_module_data("Module 3", step_pin=None, dir_pin=None)
+
+        self.build_ui()
+        self.refresh_ports()
+
+        self.root.after(100, self.update_loop)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def _add_module_data(self, name, step_pin, dir_pin):
+        idx = len(self.modules)
+        color = MODULE_COLORS[idx % len(MODULE_COLORS)]
+        mod = {
+            "id": self.next_module_id,
+            "name": name,
+            "step_pin": step_pin,
+            "dir_pin": dir_pin,
+            "pressure_hpa": tk.StringVar(value="---"),
+            "pressure_psi": tk.StringVar(value="---"),
+            "psi_history": deque(maxlen=self.graph_max_points),
+            "color": color,
+            "step_position": tk.IntVar(value=0),
+        }
+        self.modules.append(mod)
+        self.next_module_id += 1
+        return mod
+
+    # ===========================
+    # UI BUILD
+    # ===========================
+    def build_ui(self):
+        # Title bar
+        title_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        title_frame.pack(fill="x", padx=20, pady=(10, 0))
+
+        tk.Label(title_frame, text="CONTINUUM ARM CONTROLLER",
+                font=FONT_TITLE, fg=ACCENT_CYAN, bg=BG_PRIMARY).pack(side="left")
+
+        # Thin accent line under title
+        tk.Frame(self.root, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x", padx=20, pady=(5, 0))
+
+        # Connection frame
+        conn_frame = tk.Frame(self.root, bg=BG_PANEL)
+        conn_frame.pack(fill="x", padx=20, pady=(8, 0))
+
+        conn_inner = tk.Frame(conn_frame, bg=BG_PANEL)
+        conn_inner.pack(padx=10, pady=8)
+
+        tk.Label(conn_inner, text="PORT:", font=FONT_BODY,
+                fg=TEXT_SECONDARY, bg=BG_PANEL).grid(row=0, column=0, padx=(0, 5))
+
+        self.port_dropdown = ttk.Combobox(conn_inner, textvariable=self.port_var, width=30)
+        self.port_dropdown.grid(row=0, column=1, padx=5)
+
+        refresh_btn = AccentButton(conn_inner, text="Refresh",
+                                   command=self.refresh_ports)
+        refresh_btn.grid(row=0, column=2, padx=5)
+
+        connect_btn = AccentButton(conn_inner, text="Connect", accent=ACCENT_GREEN,
+                                   command=self.connect_selected)
+        connect_btn.grid(row=0, column=3, padx=5)
+
+        # Status row
+        status_row = tk.Frame(conn_frame, bg=BG_PANEL)
+        status_row.pack(padx=10, pady=(0, 8))
+
+        self._conn_dot = StatusDot(status_row, color=ACCENT_RED, size=8)
+        self._conn_dot.pack(side="left", padx=(0, 5))
+        # Override StatusDot background for panel
+        self._conn_dot.configure(bg=BG_PANEL)
+        self._conn_dot._canvas.configure(bg=BG_PANEL)
+
+        tk.Label(status_row, textvariable=self.connection,
+                font=FONT_BODY, fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=(0, 20))
+
+        tk.Label(status_row, text="STATUS:", font=FONT_BODY,
+                fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Label(status_row, textvariable=self.status,
+                font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="left", padx=5)
+
+        # Stepper Position Bar (NEW)
+        stepper_border = tk.Frame(self.root, bg=ACCENT_CYAN_DIM, padx=1, pady=1)
+        stepper_border.pack(fill="x", padx=20, pady=(8, 0))
+        self.stepper_bar = StepperPositionBar(stepper_border)
+        self.stepper_bar.pack(fill="x")
+        self.stepper_bar.rebuild(self.modules)
+
+        # Pressure display
+        pressure_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        pressure_outer.pack(fill="x", padx=20, pady=(8, 0))
+
+        tk.Frame(pressure_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
+        tk.Label(pressure_outer, text="LIVE PRESSURE", font=FONT_LABEL,
+                fg=ACCENT_CYAN_DIM, bg=BG_PRIMARY).pack(anchor="w", padx=5, pady=(3, 0))
+
+        self.pressure_frame = tk.Frame(pressure_outer, bg=BG_PRIMARY)
+        self.pressure_frame.pack(fill="x", padx=5, pady=5)
+        self._rebuild_pressure_display()
+
+        # IMU display
+        imu_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        imu_outer.pack(fill="x", padx=20, pady=(8, 0))
+
+        tk.Frame(imu_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
+        tk.Label(imu_outer, text="IMU (MPU-6500)", font=FONT_LABEL,
+                fg=ACCENT_CYAN_DIM, bg=BG_PRIMARY).pack(anchor="w", padx=5, pady=(3, 0))
+
+        imu_frame = tk.Frame(imu_outer, bg=BG_PANEL)
+        imu_frame.pack(fill="x", padx=5, pady=5)
+
+        imu_row1 = tk.Frame(imu_frame, bg=BG_PANEL)
+        imu_row1.pack(fill="x", padx=10, pady=(5, 2))
+        tk.Label(imu_row1, text="ACCEL", font=FONT_BODY_BOLD,
+                fg=ACCENT_CYAN, bg=BG_PANEL, width=6).pack(side="left")
+        for axis in ("ax", "ay", "az"):
+            lbl = axis.upper().replace("A", "")
+            tk.Label(imu_row1, text=f"{lbl}:", font=FONT_BODY,
+                    fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=(10, 0))
+            tk.Label(imu_row1, textvariable=self.imu_data[axis],
+                    font=FONT_DATA, fg=TEXT_PRIMARY, bg=BG_PANEL,
+                    width=8).pack(side="left")
+
+        imu_row2 = tk.Frame(imu_frame, bg=BG_PANEL)
+        imu_row2.pack(fill="x", padx=10, pady=(2, 2))
+        tk.Label(imu_row2, text="GYRO", font=FONT_BODY_BOLD,
+                fg=ACCENT_ORANGE, bg=BG_PANEL, width=6).pack(side="left")
+        for axis in ("gx", "gy", "gz"):
+            lbl = axis.upper().replace("G", "")
+            tk.Label(imu_row2, text=f"{lbl}:", font=FONT_BODY,
+                    fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=(10, 0))
+            tk.Label(imu_row2, textvariable=self.imu_data[axis],
+                    font=FONT_DATA, fg=TEXT_PRIMARY, bg=BG_PANEL,
+                    width=8).pack(side="left")
+
+        imu_row3 = tk.Frame(imu_frame, bg=BG_PANEL)
+        imu_row3.pack(fill="x", padx=10, pady=(2, 5))
+        tk.Label(imu_row3, text="TEMP", font=FONT_BODY_BOLD,
+                fg=TEXT_SECONDARY, bg=BG_PANEL, width=6).pack(side="left")
+        tk.Label(imu_row3, textvariable=self.imu_data["temp"],
+                font=FONT_DATA, fg=TEXT_PRIMARY, bg=BG_PANEL,
+                width=8).pack(side="left", padx=(10, 0))
+        tk.Label(imu_row3, text="\u00b0C", font=FONT_BODY,
+                fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+
+        # Mode selector
+        mode_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        mode_frame.pack(fill="x", padx=20, pady=(10, 0))
+
+        tk.Label(mode_frame, text="MODE:", font=FONT_BODY_BOLD,
+                fg=ACCENT_CYAN, bg=BG_PRIMARY).pack(side="left", padx=(0, 10))
+
+        for text, val in [("Burst Control", "burst"), ("PID Control", "pid"),
+                          ("Calibration", "calibration")]:
+            rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode,
+                                 value=val, command=self.switch_mode)
+            rb.pack(side="left", padx=10)
+
+        # Panel container
+        self.panel_container = tk.Frame(self.root, bg=BG_PRIMARY)
+        self.panel_container.pack(fill="both", expand=True, padx=20, pady=5)
+
+        # Create panels
+        self.burst_panel = BurstPanel(
+            self.panel_container, self.modules, self.send,
+            self.emergency_stop)
+
+        self.pid_panel = PIDPanel(
+            self.panel_container, self.send,
+            self.start_pid, self.stop_pid, self.emergency_stop)
+
+        self.cal_panel = CalibrationPanel(
+            self.panel_container, self.send,
+            self.cal_set_back, self.cal_set_front,
+            self.cal_save, self.cal_clear, self.emergency_stop)
+
+        # Show default panel
+        self.burst_panel.pack(fill="both", expand=True)
+
+        # Logging
+        log_frame = tk.Frame(self.root, bg=BG_PRIMARY)
+        log_frame.pack(fill="x", padx=20, pady=(5, 0))
+
+        tk.Frame(log_frame, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
+        tk.Label(log_frame, text="LOGGING", font=FONT_LABEL,
+                fg=ACCENT_CYAN_DIM, bg=BG_PRIMARY).pack(anchor="w", padx=5, pady=(3, 0))
+
+        log_btns = tk.Frame(log_frame, bg=BG_PRIMARY)
+        log_btns.pack(pady=5)
+        AccentButton(log_btns, text="Start Logging", accent=ACCENT_GREEN,
+                    command=self.start_log).pack(side="left", padx=5)
+        AccentButton(log_btns, text="Stop Logging",
+                    command=self.stop_log).pack(side="left", padx=5)
+
+        # Pressure graph
+        graph_outer = tk.Frame(self.root, bg=BG_PRIMARY)
+        graph_outer.pack(fill="both", expand=True, padx=20, pady=(5, 10))
+
+        tk.Frame(graph_outer, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
+        tk.Label(graph_outer, text="PRESSURE (PSI)", font=FONT_LABEL,
+                fg=ACCENT_CYAN_DIM, bg=BG_PRIMARY).pack(anchor="w", padx=5, pady=(3, 0))
+
+        self.graph = PressureGraph(graph_outer)
+        self.graph.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # ===========================
+    # DYNAMIC UI
+    # ===========================
+    def _rebuild_pressure_display(self):
+        for w in self.pressure_frame.winfo_children():
+            w.destroy()
+        for i, mod in enumerate(self.modules):
+            PressureBox(self.pressure_frame, mod).grid(row=0, column=i, padx=6, pady=3)
+
+    # ===========================
+    # PORT HANDLING
+    # ===========================
+    def refresh_ports(self):
+        import serial.tools.list_ports
+        ports = serial.tools.list_ports.comports()
+        self.ports = [
+            p.device for p in ports
+            if "usb" in p.device.lower() or "tty." in p.device.lower() or p.device.upper().startswith("COM")
+        ]
+        self.port_dropdown['values'] = self.ports
+
+        for p in self.ports:
+            if "usbmodem" in p or "usbserial" in p:
+                self.port_var.set(p)
+                return
+        if self.ports:
+            self.port_var.set(self.ports[0])
+
+    def connect_selected(self):
+        port = self.port_var.get()
+        if not port:
+            self.status.set("No port selected")
+            return
+
+        self.status.set("CONNECTING...")
+
+        def connect_thread():
+            success = self.arduino.connect(port)
+            if success:
+                self.connection.set(port)
+                self.status.set("CONNECTED")
+                self._conn_dot.set_color(ACCENT_GREEN)
+                threading.Thread(target=self.reader, daemon=True).start()
+                self.root.after(500, self.load_calibration)
+            else:
+                self.connection.set("Not connected")
+                self.status.set("CONNECTION FAILED")
+                self._conn_dot.set_color(ACCENT_RED)
+
+        threading.Thread(target=connect_thread, daemon=True).start()
+
+    # ===========================
+    # SERIAL
+    # ===========================
+    def reader(self):
+        while self.running:
+            line = self.arduino.read_line()
+            if line:
+                self.queue.put(line)
+
+    def send(self, cmd):
+        if not self.arduino.ser or not self.arduino.ser.is_open:
+            self.status.set("ERROR: NOT CONNECTED")
+            return False
+        if self.arduino.send(cmd):
+            self.status.set(f"SENT: {cmd}")
+            return True
+        # Write failed — device was disconnected. Update UI state.
+        self.connection.set("Not connected")
+        self.status.set("DEVICE DISCONNECTED")
+        try:
+            self._conn_dot.set_color(ACCENT_RED)
+        except Exception:
+            pass
+        return False
+
+    # ===========================
+    # MODE SWITCHING
+    # ===========================
+    def switch_mode(self):
+        self.send("STOP")
+        self.pid_active = False
+        self.pid_setpoint_psi = 0.0
+        self.pid_panel.set_inactive()
+
+        self.burst_panel.pack_forget()
+        self.pid_panel.pack_forget()
+        self.cal_panel.pack_forget()
+
+        mode = self.mode.get()
+        if mode == "burst":
+            self.burst_panel.pack(fill="both", expand=True)
+        elif mode == "pid":
+            self.pid_panel.pack(fill="both", expand=True)
+        elif mode == "calibration":
+            self.send("RESET_POS")
+            self.step_position = 0
+
+            if self.cal_back_wall is not None and self.cal_front_wall is not None:
+                self.cal_panel.set_limits_display(self.cal_back_wall, self.cal_front_wall)
+                self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
+            else:
+                self.cal_panel.clear_display()
+                self.send("CLEAR_LIMITS")
+
+            self.cal_panel.pack(fill="both", expand=True)
+
+    # ===========================
+    # PID CONTROL
+    # ===========================
+    def start_pid(self, val):
+        try:
+            psi = float(val)
+            if psi <= 0:
+                self.status.set("PSI must be positive")
+                return
+        except ValueError:
+            self.status.set("Invalid PSI value")
+            return
+
+        hpa = psi / 0.0145038
+        self.pid_setpoint_psi = psi
+        self.pid_active = True
+
+        self.send(f"SET {hpa:.1f}")
+        self.pid_panel.set_active(psi, hpa)
+
+    def stop_pid(self):
+        self.send("STOP")
+        self.pid_active = False
+        self.pid_setpoint_psi = 0.0
+        self.pid_panel.set_inactive("PID STOPPED")
+
+    def emergency_stop(self):
+        self.send("STOP")
+        self.pid_active = False
+        self.pid_setpoint_psi = 0.0
+        self.pid_panel.set_emergency()
+        self.status.set("EMERGENCY STOP SENT")
+
+    # ===========================
+    # CALIBRATION
+    # ===========================
+    def cal_set_back(self):
+        self.cal_back_wall = self.step_position
+        self.send("SET_MIN")
+        self.cal_panel.cal_back_var.set(f"Back wall: {self.cal_back_wall} steps")
+        self._cal_check_ready()
+
+    def cal_set_front(self):
+        self.cal_front_wall = self.step_position
+        self.send("SET_MAX")
+        self.cal_panel.cal_front_var.set(f"Front wall: {self.cal_front_wall} steps")
+        self._cal_check_ready()
+
+    def _cal_check_ready(self):
+        if self.cal_back_wall is not None and self.cal_front_wall is not None:
+            if self.cal_back_wall < self.cal_front_wall:
+                rng = self.cal_front_wall - self.cal_back_wall
+                self.cal_panel.cal_range_var.set(f"{rng} steps")
+                self.cal_panel.enable_save(True)
+            else:
+                self.cal_panel.cal_range_var.set("Error: back must be < front")
+                self.cal_panel.enable_save(False)
+
+    def cal_save(self):
+        if self.cal_back_wall is None or self.cal_front_wall is None:
+            return
+        cal_data = {
+            "back_wall": self.cal_back_wall,
+            "front_wall": self.cal_front_wall,
+        }
+        try:
+            with open(self.cal_file, "w") as f:
+                json.dump(cal_data, f, indent=2)
+            self.calibration_loaded = True
+            self.status.set(f"CALIBRATION SAVED: [{self.cal_back_wall}, {self.cal_front_wall}]")
+        except Exception as e:
+            self.status.set(f"Error saving calibration: {e}")
+
+    def cal_clear(self):
+        self.send("CLEAR_LIMITS")
+        self.cal_back_wall = None
+        self.cal_front_wall = None
+        self.cal_panel.clear_display()
+        self.calibration_loaded = False
+
+        if os.path.exists(self.cal_file):
+            try:
+                os.remove(self.cal_file)
+            except Exception as e:
+                print(f"[WARN] Could not delete calibration file: {e}")
+
+        self.status.set("LIMITS CLEARED")
+
+    def _load_calibration_from_disk(self):
+        if not os.path.exists(self.cal_file):
+            return
+        try:
+            with open(self.cal_file, "r") as f:
+                cal_data = json.load(f)
+            back = cal_data.get("back_wall")
+            front = cal_data.get("front_wall")
+            if back is not None and front is not None:
+                self.cal_back_wall = back
+                self.cal_front_wall = front
+                self.calibration_loaded = True
+                print(f"[INFO] Calibration loaded from disk: [{back}, {front}]")
+        except Exception as e:
+            print(f"[WARN] Could not load calibration: {e}")
+
+    def load_calibration(self):
+        if self.cal_back_wall is not None and self.cal_front_wall is not None:
+            self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
+            self.status.set(f"CALIBRATION LOADED: [{self.cal_back_wall}, {self.cal_front_wall}]")
+        elif os.path.exists(self.cal_file):
+            self._load_calibration_from_disk()
+            if self.cal_back_wall is not None and self.cal_front_wall is not None:
+                self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
+                self.status.set(f"CALIBRATION LOADED: [{self.cal_back_wall}, {self.cal_front_wall}]")
+
+    # ===========================
+    # UPDATE LOOP
+    # ===========================
+    def update_loop(self):
+        while not self.queue.empty():
+            line = self.queue.get()
+
+            # Multi-module pressure: PM,module_id,time_ms,hPa,psi[,pos]
+            if line.startswith("PM,"):
+                parts = line.split(",")
+                if len(parts) >= 5:
+                    try:
+                        mod_id = int(parts[1])
+                        hpa = float(parts[3])
+                        psi = float(parts[4])
+
+                        for mod in self.modules:
+                            if mod["id"] == mod_id:
+                                mod["pressure_hpa"].set(f"{hpa:.1f}")
+                                mod["pressure_psi"].set(f"{psi:.3f}")
+                                mod["psi_history"].append(psi)
+
+                                # Parse position if available
+                                if len(parts) >= 6:
+                                    try:
+                                        pos = int(parts[5])
+                                        mod["step_position"].set(pos)
+                                        self.stepper_bar.set_position(mod_id, pos)
+                                    except ValueError:
+                                        pass
+                                break
+                    except (ValueError, IndexError):
+                        pass
+
+            # Legacy single-sensor: P,time_ms,hPa,psi[,pos]
+            elif line.startswith("P,"):
+                parts = line.split(",")
+                if len(parts) >= 4:
+                    t_ms = parts[1]
+                    hpa = float(parts[2])
+                    psi = float(parts[3])
+
+                    if self.modules:
+                        mod = self.modules[0]
+                        mod["pressure_hpa"].set(f"{hpa:.1f}")
+                        mod["pressure_psi"].set(f"{psi:.3f}")
+                        mod["psi_history"].append(psi)
+
+                    # Update step position
+                    if len(parts) >= 5:
+                        try:
+                            pos = int(parts[4])
+                            self.step_position = pos
+                            if self.modules:
+                                self.modules[0]["step_position"].set(pos)
+                                self.stepper_bar.set_position(self.modules[0]["id"], pos)
+                            self.cal_panel.set_position(pos)
+                        except ValueError:
+                            pass
+
+                    self.logger.log([float(t_ms), hpa, psi, 0.0])
+
+            # IMU data: IMU,time_ms,ax,ay,az,gx,gy,gz,tempC
+            elif line.startswith("IMU,"):
+                parts = line.split(",")
+                if len(parts) >= 9:
+                    try:
+                        self.imu_data["ax"].set(f"{float(parts[2]):.4f}")
+                        self.imu_data["ay"].set(f"{float(parts[3]):.4f}")
+                        self.imu_data["az"].set(f"{float(parts[4]):.4f}")
+                        self.imu_data["gx"].set(f"{float(parts[5]):.2f}")
+                        self.imu_data["gy"].set(f"{float(parts[6]):.2f}")
+                        self.imu_data["gz"].set(f"{float(parts[7]):.2f}")
+                        self.imu_data["temp"].set(f"{float(parts[8]):.1f}")
+                    except (ValueError, IndexError):
+                        pass
+
+            elif line.startswith("SETPOINT UPDATED"):
+                self.status.set(line)
+            elif line == "STOPPED":
+                self.status.set("ARDUINO: STOPPED")
+            else:
+                self.status.set(line)
+
+        try:
+            self.graph.draw(self.modules, self.pid_active, self.pid_setpoint_psi)
+        except Exception as e:
+            print(f"[GRAPH ERROR] {e}")
+
+        self.root.after(100, self.update_loop)
+
+    # ===========================
+    # LOGGING
+    # ===========================
+    def start_log(self):
+        name = self.logger.start()
+        if name:
+            self.status.set(f"LOGGING: {name}")
+
+    def stop_log(self):
+        self.logger.stop()
+        self.status.set("LOGGING STOPPED")
+
+    # ===========================
+    # CLOSE
+    # ===========================
+    def on_close(self):
+        self.running = False
+        try:
+            self.arduino.send("STOP")
+        except:
+            pass
+        self.arduino.close()
+        self.root.destroy()

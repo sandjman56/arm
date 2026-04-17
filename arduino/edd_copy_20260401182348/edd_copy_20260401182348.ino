@@ -1,0 +1,748 @@
+#include <Wire.h>
+#include <Adafruit_MPRLS.h>
+#include <Servo.h>
+
+// Forward-declare MPUData so Arduino's auto-prototype of mpuRead() compiles
+struct MPUData {
+  float ax, ay, az;   // g
+  float gx, gy, gz;   // deg/s
+  float tempC;
+};
+
+// =========================
+// Bend servos (XY and XZ planes)
+// =========================
+// Must be PWM-capable pins. On Uno: 3,5,6,9,10,11 are PWM.
+// Pins 3,4,5,7,8 are used by steppers + EN, so use 9-12.
+#define BEND_SERVO_A_PIN 9   // XY left
+#define BEND_SERVO_B_PIN 10  // XY right
+#define BEND_SERVO_C_PIN 11  // XZ left
+#define BEND_SERVO_D_PIN 12  // XZ right
+
+// Neutral angle and max deflection (degrees)
+#define BEND_CENTER_DEG 90
+#define BEND_MAX_DEG    60
+
+Servo bendServoA;
+Servo bendServoB;
+Servo bendServoC;
+Servo bendServoD;
+int bendValue = 0;    // XY -100..100
+int bendValueXZ = 0;  // XZ -100..100
+int bendValueAll = 0; // All servos -100..100
+
+// =========================
+// I2C Multiplexer (PCA9548A)
+// =========================
+#define MUX_ADDR 0x70
+
+void tcaselect(uint8_t channel) {
+  Wire.beginTransmission(MUX_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+// =========================
+// IMU — MPU-6500 via mux (raw register access)
+// =========================
+#define IMU_CHANNEL   2    // SD2/SC2 — matches your test wiring
+#define MPU_ADDR      0x68 // AD0→GND
+
+// MPU-6500 registers
+#define REG_WHO_AM_I     0x75
+#define REG_PWR_MGMT_1   0x6B
+#define REG_PWR_MGMT_2   0x6C
+#define REG_SMPLRT_DIV   0x19
+#define REG_CONFIG        0x1A
+#define REG_GYRO_CONFIG   0x1B
+#define REG_ACCEL_CONFIG  0x1C
+#define REG_ACCEL_XOUT_H  0x3B  // 14-byte burst: accel + temp + gyro
+
+float accelScale = 1.0;
+float gyroScale  = 1.0;
+bool  imuPresent = false;
+
+// =========================
+// Low-level I2C register helpers (for MPU-6500)
+// =========================
+void writeRegister(uint8_t devAddr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(devAddr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t readRegister(uint8_t devAddr, uint8_t reg) {
+  Wire.beginTransmission(devAddr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(devAddr, (uint8_t)1);
+  return Wire.read();
+}
+
+void readRegisters(uint8_t devAddr, uint8_t reg, uint8_t *buf, uint8_t count) {
+  Wire.beginTransmission(devAddr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom(devAddr, count);
+  for (uint8_t i = 0; i < count; i++) {
+    buf[i] = Wire.read();
+  }
+}
+
+// =========================
+// MPU-6500 init (must call tcaselect(IMU_CHANNEL) first)
+// =========================
+bool mpuInit() {
+  // Wake up — clear sleep bit, PLL with gyro X clock
+  writeRegister(MPU_ADDR, REG_PWR_MGMT_1, 0x01);
+  delay(100);
+
+  // Verify identity
+  uint8_t whoami = readRegister(MPU_ADDR, REG_WHO_AM_I);
+  Serial.print("WHO_AM_I = 0x");
+  Serial.println(whoami, HEX);
+  if (whoami == 0xFF || whoami == 0x00) {
+    Serial.println("ERROR: no device on I2C bus (got 0xFF/0x00)");
+    return false;
+  }
+  if (whoami != 0x70 && whoami != 0x71 && whoami != 0x73) {
+    Serial.print("WARNING: unexpected WHO_AM_I 0x");
+    Serial.print(whoami, HEX);
+    Serial.println(" — may not be MPU-6500, continuing anyway");
+  }
+
+  // Sample rate: 1000/(1+9) = 100 Hz
+  writeRegister(MPU_ADDR, REG_SMPLRT_DIV, 9);
+
+  // DLPF mode 3: accel BW 44Hz, gyro BW 42Hz
+  writeRegister(MPU_ADDR, REG_CONFIG, 0x03);
+
+  // Gyro: ±500 deg/s (bits 4:3 = 01)
+  writeRegister(MPU_ADDR, REG_GYRO_CONFIG, 0x08);
+  gyroScale = 500.0 / 32768.0;
+
+  // Accel: ±4g (bits 4:3 = 01)
+  writeRegister(MPU_ADDR, REG_ACCEL_CONFIG, 0x08);
+  accelScale = 4.0 / 32768.0;
+
+  // Enable all axes
+  writeRegister(MPU_ADDR, REG_PWR_MGMT_2, 0x00);
+
+  return true;
+}
+
+// =========================
+// MPU-6500 burst read (must call tcaselect(IMU_CHANNEL) first)
+// =========================
+MPUData mpuRead() {
+  MPUData d;
+  uint8_t buf[14];
+
+  // 0x3B–0x48: AXH AXL AYH AYL AZH AZL TH TL GXH GXL GYH GYL GZH GZL
+  readRegisters(MPU_ADDR, REG_ACCEL_XOUT_H, buf, 14);
+
+  int16_t rawAx = (int16_t)(buf[0]  << 8 | buf[1]);
+  int16_t rawAy = (int16_t)(buf[2]  << 8 | buf[3]);
+  int16_t rawAz = (int16_t)(buf[4]  << 8 | buf[5]);
+  int16_t rawT  = (int16_t)(buf[6]  << 8 | buf[7]);
+  int16_t rawGx = (int16_t)(buf[8]  << 8 | buf[9]);
+  int16_t rawGy = (int16_t)(buf[10] << 8 | buf[11]);
+  int16_t rawGz = (int16_t)(buf[12] << 8 | buf[13]);
+
+  d.ax = rawAx * accelScale;
+  d.ay = rawAy * accelScale;
+  d.az = rawAz * accelScale;
+  d.gx = rawGx * gyroScale;
+  d.gy = rawGy * gyroScale;
+  d.gz = rawGz * gyroScale;
+  d.tempC = (rawT / 333.87) + 21.0;
+
+  return d;
+}
+
+// =========================
+// Sensor objects
+// =========================
+Adafruit_MPRLS mpr = Adafruit_MPRLS();
+
+// =========================
+// Direction constants
+// =========================
+#define EN_PIN   5
+
+#define DIR_CW  LOW
+#define DIR_CCW HIGH
+
+// =========================
+// Multi-module support
+// =========================
+#define MAX_MODULES 8
+
+// Pressure sensor channel mapping (via PCA9548A mux)
+#define NUM_PRESSURE_SENSORS 3
+uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3};
+// index 0 -> Module 1 on ch 1 (SD1/SC1)
+// index 1 -> Module 2 on ch 0 (SD0/SC0)
+// index 2 -> Module 3 on ch 3 (SD3/SC3)
+bool    pressurePresent[MAX_MODULES]  = {false};
+
+struct Module {
+  int  stepPin;
+  int  dirPin;
+  bool active;
+  long stepPosition;
+  long minStepLimit;
+  long maxStepLimit;
+  bool limitsActive;
+};
+
+Module modules[MAX_MODULES];
+int moduleCount = 0;
+
+// =========================
+// Motion tuning
+// =========================
+const int BURST_STEPS = 40;
+const int STEP_DELAY_US = 2000;
+
+// =========================
+// Serial buffer
+// =========================
+String inputBuffer = "";
+
+// =========================
+// PID params (operates on module 0)
+// =========================
+float SETPOINT_HPA = 0.0;
+float currentPressure = 0.0;
+
+float Kp = 25.0;
+float Ki = 2.0;
+float Kd = 8.0;
+
+float integral = 0;
+float lastError = 0;
+
+// =========================
+// Stepper state
+// =========================
+unsigned long stepInterval = 0;
+unsigned long lastStepTime = 0;
+
+int currentDir = DIR_CCW;
+bool pidEnabled = false;
+
+// =========================
+// Timing
+// =========================
+const unsigned long PID_INTERVAL_US = 25000;
+unsigned long lastPIDTime = 0;
+
+// =========================
+// Helper: initialize a module slot
+// =========================
+void initModule(int idx, int stepPin, int dirPin) {
+  modules[idx].stepPin      = stepPin;
+  modules[idx].dirPin       = dirPin;
+  modules[idx].active       = true;
+  modules[idx].stepPosition = 0;
+  modules[idx].minStepLimit = -999999L;
+  modules[idx].maxStepLimit = 999999L;
+  modules[idx].limitsActive = false;
+
+  pinMode(stepPin, OUTPUT);
+  pinMode(dirPin, OUTPUT);
+  digitalWrite(stepPin, LOW);
+  digitalWrite(dirPin, DIR_CCW);
+}
+
+// =========================
+// Setup
+// =========================
+void setup() {
+  Serial.begin(115200);
+
+  // Enable pin (shared across drivers)
+  pinMode(EN_PIN, OUTPUT);
+  digitalWrite(EN_PIN, LOW);  // ENABLE DRIVER
+
+  // Default Module 1: STEP=3, DIR=4 (matches original wiring)
+  initModule(0, 3, 4);
+  initModule(1, 8, 7);
+  moduleCount = 2;
+
+  // Bend servos start detached (no power) — attached on demand by BEND command
+  pinMode(BEND_SERVO_A_PIN, OUTPUT);
+  pinMode(BEND_SERVO_B_PIN, OUTPUT);
+  pinMode(BEND_SERVO_C_PIN, OUTPUT);
+  pinMode(BEND_SERVO_D_PIN, OUTPUT);
+  digitalWrite(BEND_SERVO_A_PIN, LOW);
+  digitalWrite(BEND_SERVO_B_PIN, LOW);
+  digitalWrite(BEND_SERVO_C_PIN, LOW);
+  digitalWrite(BEND_SERVO_D_PIN, LOW);
+
+  // Initialize I2C bus
+  Wire.begin();
+  Wire.setClock(400000);  // 400kHz fast mode
+  delay(50);
+
+  // Verify mux is responding
+  Wire.beginTransmission(MUX_ADDR);
+  uint8_t muxErr = Wire.endTransmission();
+  if (muxErr == 0) {
+    Serial.print("MUX_OK addr=0x");
+    Serial.println(MUX_ADDR, HEX);
+  } else {
+    Serial.print("MUX_FAIL addr=0x");
+    Serial.print(MUX_ADDR, HEX);
+    Serial.print(" err=");
+    Serial.println(muxErr);
+  }
+
+  // Initialize pressure sensors through mux
+  for (int i = 0; i < NUM_PRESSURE_SENSORS; i++) {
+    tcaselect(pressureChannels[i]);
+    if (mpr.begin()) {
+      pressurePresent[i] = true;
+      Serial.print("SENSOR_OK MPRLS ch=");
+      Serial.println(pressureChannels[i]);
+    } else {
+      pressurePresent[i] = false;
+      Serial.print("SENSOR_FAIL MPRLS ch=");
+      Serial.println(pressureChannels[i]);
+    }
+  }
+
+  // Initialize MPU-6500 IMU through mux
+  tcaselect(IMU_CHANNEL);
+  delay(10);
+  if (mpuInit()) {
+    imuPresent = true;
+    Serial.print("SENSOR_OK MPU6500 ch=");
+    Serial.println(IMU_CHANNEL);
+  } else {
+    imuPresent = false;
+    Serial.print("SENSOR_FAIL MPU6500 ch=");
+    Serial.println(IMU_CHANNEL);
+  }
+
+  Serial.println("READY");
+}
+
+// =========================
+// Stepper burst for a specific module (with position tracking & limits)
+// =========================
+void stepBurstModule(int idx, int dir) {
+  if (idx < 0 || idx >= moduleCount || !modules[idx].active) return;
+
+  Module &m = modules[idx];
+  digitalWrite(m.dirPin, dir);
+
+  int stepDir = (dir == DIR_CW) ? 1 : -1;
+
+  for (int i = 0; i < BURST_STEPS; i++) {
+    long nextPos = m.stepPosition + stepDir;
+
+    if (m.limitsActive) {
+      if (nextPos < m.minStepLimit || nextPos > m.maxStepLimit) {
+        if (i == 0) {
+          Serial.print("LIMIT_HIT ");
+          Serial.print(idx + 1);
+          Serial.print(",");
+          Serial.println(m.stepPosition);
+        }
+        break;
+      }
+    }
+
+    digitalWrite(m.stepPin, HIGH);
+    delayMicroseconds(STEP_DELAY_US);
+    digitalWrite(m.stepPin, LOW);
+    delayMicroseconds(STEP_DELAY_US);
+
+    m.stepPosition = nextPos;
+  }
+}
+
+// Legacy wrapper: burst on module 0 (for PID / calibration)
+void stepBurst(int dir) {
+  stepBurstModule(0, dir);
+}
+
+// =========================
+// Parse module index from args (1-based in protocol, 0-based internally)
+// Returns 0 if args is empty or invalid (default to module 1)
+// =========================
+int parseModuleIdx(String &args) {
+  if (args.length() == 0) return 0;
+  int id = args.toInt();
+  if (id < 1 || id > moduleCount) return 0;
+  return id - 1;
+}
+
+// =========================
+// Command handling
+// =========================
+void handleCommand(String cmd) {
+  cmd.trim();
+
+  // Extract first word as command (split on first space or comma)
+  String command = cmd;
+  String args = "";
+
+  int spaceIdx = cmd.indexOf(' ');
+  int commaIdx = cmd.indexOf(',');
+
+  int splitIdx = -1;
+  if (spaceIdx != -1 && commaIdx != -1) {
+    splitIdx = min(spaceIdx, commaIdx);
+  } else if (spaceIdx != -1) {
+    splitIdx = spaceIdx;
+  } else if (commaIdx != -1) {
+    splitIdx = commaIdx;
+  }
+
+  if (splitIdx != -1) {
+    command = cmd.substring(0, splitIdx);
+    args = cmd.substring(splitIdx + 1);
+    args.trim();
+  }
+
+  // === PID commands ===
+
+  if (command == "SET") {
+    float val = args.toFloat();
+    SETPOINT_HPA = val;
+    pidEnabled = true;
+    integral = 0;
+    lastError = 0;
+
+    Serial.print("SETPOINT UPDATED -> ");
+    Serial.println(SETPOINT_HPA);
+  }
+
+  else if (command == "STOP") {
+    pidEnabled = false;
+    stepInterval = 0;
+    Serial.println("STOPPED");
+  }
+
+  // === Burst commands (with optional module ID) ===
+  // GUI sends: INFLATE,1  INFLATE,2  DEFLATE,1  etc.
+  // Legacy (no arg) defaults to module 1
+
+  else if (command == "INFLATE") {
+    pidEnabled = false;
+    int idx = parseModuleIdx(args);
+    Serial.print("ACTION: INFLATE M");
+    Serial.println(idx + 1);
+    stepBurstModule(idx, DIR_CW);
+  }
+
+  // === Bend (XY plane servos) ===
+  // BEND,<int>  where int is -100..100. 0 = center.
+  // Legacy: BEND,LEFT | BEND,RIGHT | BEND,CENTER
+  else if (command == "BEND") {
+    int v;
+    if (args == "LEFT")       v = -100;
+    else if (args == "RIGHT") v =  100;
+    else if (args == "CENTER" || args.length() == 0) v = 0;
+    else                      v = args.toInt();
+
+    if (v < -100) v = -100;
+    if (v >  100) v =  100;
+    bendValue = v;
+
+    // Only one servo powered at a time. A = LEFT, B = RIGHT.
+    // Slider left (v<0) -> drive A, detach B. Slider right (v>0) -> drive B, detach A.
+    int mag = v < 0 ? -v : v;
+    int offset = (int)((long)mag * BEND_MAX_DEG / 100);
+    int angleA = BEND_CENTER_DEG;
+    int angleB = BEND_CENTER_DEG;
+
+    if (v < 0) {
+      if (bendServoB.attached()) bendServoB.detach();
+      if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
+      angleA = BEND_CENTER_DEG + offset;
+      bendServoA.write(angleA);
+    } else if (v > 0) {
+      if (bendServoA.attached()) bendServoA.detach();
+      if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
+      angleB = BEND_CENTER_DEG + offset;
+      bendServoB.write(angleB);
+    } else {
+      if (bendServoA.attached()) bendServoA.detach();
+      if (bendServoB.attached()) bendServoB.detach();
+    }
+
+    Serial.print("BEND ");
+    Serial.print(v);
+    Serial.print(" A=");
+    Serial.print(angleA);
+    Serial.print(" B=");
+    Serial.println(angleB);
+  }
+
+  // === Bend XZ plane (servos C/D) ===
+  // BEND_XZ,<int>  where int is -100..100. 0 = center.
+  else if (command == "BEND_XZ") {
+    int v;
+    if (args == "CENTER" || args.length() == 0) v = 0;
+    else                                        v = args.toInt();
+
+    if (v < -100) v = -100;
+    if (v >  100) v =  100;
+    bendValueXZ = v;
+
+    int mag = v < 0 ? -v : v;
+    int offset = (int)((long)mag * BEND_MAX_DEG / 100);
+    int angleC = BEND_CENTER_DEG;
+    int angleD = BEND_CENTER_DEG;
+
+    if (v < 0) {
+      if (bendServoD.attached()) bendServoD.detach();
+      if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
+      angleC = BEND_CENTER_DEG + offset;
+      bendServoC.write(angleC);
+    } else if (v > 0) {
+      if (bendServoC.attached()) bendServoC.detach();
+      if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
+      angleD = BEND_CENTER_DEG + offset;
+      bendServoD.write(angleD);
+    } else {
+      if (bendServoC.attached()) bendServoC.detach();
+      if (bendServoD.attached()) bendServoD.detach();
+    }
+
+    Serial.print("BEND_XZ ");
+    Serial.print(v);
+    Serial.print(" C=");
+    Serial.print(angleC);
+    Serial.print(" D=");
+    Serial.println(angleD);
+  }
+
+  // === Bend ALL servos to the same angle ===
+  // BEND_ALL,<int>  where int is -100..100. 0 = center/detach.
+  else if (command == "BEND_ALL") {
+    int v;
+    if (args == "CENTER" || args.length() == 0) v = 0;
+    else                                        v = args.toInt();
+
+    if (v < -100) v = -100;
+    if (v >  100) v =  100;
+    bendValueAll = v;
+
+    int allAngle = BEND_CENTER_DEG;
+    if (v == 0) {
+      if (bendServoA.attached()) bendServoA.detach();
+      if (bendServoB.attached()) bendServoB.detach();
+      if (bendServoC.attached()) bendServoC.detach();
+      if (bendServoD.attached()) bendServoD.detach();
+    } else {
+      int mag = v < 0 ? -v : v;
+      int offset = (int)((long)mag * BEND_MAX_DEG / 100);
+      allAngle = (v > 0) ? (BEND_CENTER_DEG + offset) : (BEND_CENTER_DEG - offset);
+
+      if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
+      if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
+      if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
+      if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
+
+      bendServoA.write(allAngle);
+      bendServoB.write(allAngle);
+      bendServoC.write(allAngle);
+      bendServoD.write(allAngle);
+    }
+
+    Serial.print("BEND_ALL ");
+    Serial.print(v);
+    Serial.print(" angle=");
+    Serial.println(allAngle);
+  }
+
+  else if (command == "DEFLATE") {
+    pidEnabled = false;
+    int idx = parseModuleIdx(args);
+    Serial.print("ACTION: DEFLATE M");
+    Serial.println(idx + 1);
+    stepBurstModule(idx, DIR_CCW);
+  }
+
+  // === PID gain tuning ===
+
+  else if (command == "KP") {
+    Kp = args.toFloat();
+    Serial.print("KP -> ");
+    Serial.println(Kp);
+  }
+
+  else if (command == "KI") {
+    Ki = args.toFloat();
+    integral = 0;
+    Serial.print("KI -> ");
+    Serial.println(Ki);
+  }
+
+  else if (command == "KD") {
+    Kd = args.toFloat();
+    Serial.print("KD -> ");
+    Serial.println(Kd);
+  }
+
+  // === Calibration commands (operate on module 0) ===
+
+  else if (command == "RESET_POS") {
+    modules[0].stepPosition = 0;
+    Serial.println("POS_RESET 0");
+  }
+
+  else if (command == "SET_MIN") {
+    modules[0].minStepLimit = modules[0].stepPosition;
+    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
+    Serial.print("MIN_SET ");
+    Serial.println(modules[0].minStepLimit);
+  }
+
+  else if (command == "SET_MAX") {
+    modules[0].maxStepLimit = modules[0].stepPosition;
+    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
+    Serial.print("MAX_SET ");
+    Serial.println(modules[0].maxStepLimit);
+  }
+
+  else if (command == "SET_LIMITS") {
+    int commaPos = args.indexOf(',');
+    if (commaPos != -1) {
+      modules[0].minStepLimit = args.substring(0, commaPos).toInt();
+      modules[0].maxStepLimit = args.substring(commaPos + 1).toInt();
+      modules[0].limitsActive = true;
+      Serial.print("LIMITS_SET ");
+      Serial.print(modules[0].minStepLimit);
+      Serial.print(",");
+      Serial.println(modules[0].maxStepLimit);
+    }
+  }
+
+  else if (command == "CLEAR_LIMITS") {
+    modules[0].limitsActive = false;
+    modules[0].minStepLimit = -999999L;
+    modules[0].maxStepLimit = 999999L;
+    Serial.println("LIMITS_CLEARED");
+  }
+
+  else if (command == "GET_POS") {
+    Serial.print("POS ");
+    Serial.println(modules[0].stepPosition);
+  }
+
+  else {
+    Serial.print("UNKNOWN: ");
+    Serial.println(cmd);
+  }
+}
+
+// =========================
+// Main loop
+// =========================
+void loop() {
+
+  // =========================
+  // SERIAL INPUT
+  // =========================
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n') {
+      handleCommand(inputBuffer);
+      inputBuffer = "";
+    } else {
+      inputBuffer += c;
+    }
+  }
+
+  // =========================
+  // SENSOR UPDATE + STREAM (20 Hz)
+  // =========================
+  static unsigned long lastStreamTime = 0;
+  unsigned long nowMs = millis();
+
+  if (nowMs - lastStreamTime >= 50) {
+    lastStreamTime = nowMs;
+
+    // Read and stream each pressure sensor
+    for (int i = 0; i < NUM_PRESSURE_SENSORS; i++) {
+      if (!pressurePresent[i]) continue;
+
+      tcaselect(pressureChannels[i]);
+      float hpa = mpr.readPressure();
+      float psi = hpa * 0.0145038;
+
+      // Module IDs are 1-based (matches GUI)
+      int modId = i + 1;
+      long stepPos = (i < moduleCount) ? modules[i].stepPosition : 0;
+
+      Serial.print("PM,");
+      Serial.print(modId);
+      Serial.print(",");
+      Serial.print(nowMs);
+      Serial.print(",");
+      Serial.print(hpa, 1);
+      Serial.print(",");
+      Serial.print(psi, 4);
+      Serial.print(",");
+      Serial.println(stepPos);
+
+      // Keep module-0 pressure for PID
+      if (i == 0) currentPressure = hpa;
+    }
+
+    // Read and stream IMU data
+    if (imuPresent) {
+      tcaselect(IMU_CHANNEL);
+      MPUData d = mpuRead();
+
+      Serial.print("IMU,");
+      Serial.print(nowMs);
+      Serial.print(",");
+      Serial.print(d.ax, 4);
+      Serial.print(",");
+      Serial.print(d.ay, 4);
+      Serial.print(",");
+      Serial.print(d.az, 4);
+      Serial.print(",");
+      Serial.print(d.gx, 2);
+      Serial.print(",");
+      Serial.print(d.gy, 2);
+      Serial.print(",");
+      Serial.print(d.gz, 2);
+      Serial.print(",");
+      Serial.println(d.tempC, 1);
+    }
+  }
+
+  // =========================
+  // PID LOOP (operates on module 0)
+  // =========================
+  unsigned long nowUs = micros();
+
+  if (pidEnabled && (nowUs - lastPIDTime >= PID_INTERVAL_US)) {
+    lastPIDTime = nowUs;
+
+    float error = SETPOINT_HPA - currentPressure;
+
+    integral += error * 0.025;
+    float derivative = (error - lastError) / 0.025;
+
+    float output = Kp * error + Ki * integral + Kd * derivative;
+
+    lastError = error;
+
+    if (output > 0) {
+      stepBurst(DIR_CW);    // inflate
+    } else if (output < 0) {
+      stepBurst(DIR_CCW);   // deflate
+    }
+  }
+}
