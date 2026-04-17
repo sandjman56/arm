@@ -109,3 +109,24 @@ def test_bending_commands_tendons_for_off_axis_target(ctrl):
             break
     # SimBackend slews to match; should converge within budget.
     assert ctrl.state == State.REACHED
+
+
+def test_rezero_requires_near_rest_pressures(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    # Manually pump a module's pressure in the sim backend.
+    ctrl.backend._pressures[1] = 5.0
+    assert ctrl.can_rezero() is False
+
+
+def test_rezero_allowed_when_at_rest(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    # Defaults: all pressures 0, backend at rest.
+    assert ctrl.can_rezero() is True
+
+
+def test_rezero_captures_new_reference(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    assert ctrl.rezero() is True  # allowed at rest

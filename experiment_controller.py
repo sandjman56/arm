@@ -196,6 +196,22 @@ class ExperimentController:
         self.backend.set_tendon_rate(3, rate_3)
         self.backend.set_tendon_rate(4, rate_4)
 
+    # --- Re-zero guard -----------------------------------------------------
+
+    NEAR_REST_PSI = 0.5  # psi threshold below which modules count as resting
+
+    def can_rezero(self) -> bool:
+        """True if safe to capture a new zero (all pressures near rest)."""
+        s = self.backend.read_state()
+        return all(abs(p) < self.NEAR_REST_PSI for p in s.module_pressures_psi.values())
+
+    def rezero(self) -> bool:
+        """Attempt to capture a new zero. Returns True if allowed."""
+        if not self.can_rezero():
+            return False
+        self.backend.capture_zero()
+        return True
+
     def _command_module_pressures_for_length(self, L_total: float) -> None:
         """Solve per-module pressures that sum to L_total using calibration curves.
 
