@@ -22,7 +22,7 @@ from widgets import (
 from arduino_interface import ArduinoInterface
 from logger import CSVLogger
 from graph import PressureGraph
-from panels import BurstPanel, PIDPanel, CalibrationPanel
+from panels import BurstPanel, PIDPanel, CalibrationPanel, ExperimentPanel
 
 
 class ArmUI:
@@ -70,12 +70,20 @@ class ArmUI:
             "temp": tk.StringVar(value="---"),
         }
 
-        # Module system
+        # Module system — configurable list of modules. Pin mapping reflects
+        # current wiring; modules beyond wired ones get None pins.
         self.modules = []
         self.next_module_id = 1
-        self._add_module_data("Module 1", step_pin=3, dir_pin=4)
-        self._add_module_data("Module 2", step_pin=8, dir_pin=7)
-        self._add_module_data("Module 3", step_pin=None, dir_pin=None)
+        MODULE_CONFIG = [
+            ("Module 1", 3, 4),
+            ("Module 2", 8, 7),
+            ("Module 3", None, None),
+            ("Module 4", None, None),
+            ("Module 5", None, None),
+            ("Module 6", None, None),
+        ]
+        for name, step_pin, dir_pin in MODULE_CONFIG:
+            self._add_module_data(name, step_pin=step_pin, dir_pin=dir_pin)
 
         self.build_ui()
         self.refresh_ports()
@@ -226,7 +234,7 @@ class ArmUI:
                 fg=ACCENT_CYAN, bg=BG_PRIMARY).pack(side="left", padx=(0, 10))
 
         for text, val in [("Burst Control", "burst"), ("PID Control", "pid"),
-                          ("Calibration", "calibration")]:
+                          ("Calibration", "calibration"), ("Experiments", "experiments")]:
             rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode,
                                  value=val, command=self.switch_mode)
             rb.pack(side="left", padx=10)
@@ -248,6 +256,33 @@ class ArmUI:
             self.panel_container, self.send,
             self.cal_set_back, self.cal_set_front,
             self.cal_save, self.cal_clear, self.emergency_stop)
+
+        # Experiments mode: backend + controller + panel.
+        from length_calibration import load_or_default
+        from experiment_backend import SimBackend
+        from experiment_controller import ExperimentController
+
+        self.length_cal_path = os.path.join(os.path.dirname(__file__) or ".", "length_calibration.json")
+        self.length_cal = load_or_default(self.length_cal_path)
+        # Start with a SimBackend; _refresh_experiment_backend() swaps to
+        # LiveBackend whenever serial is connected.
+        self.experiment_backend = SimBackend(
+            L_rest=self.length_cal.L_rest, num_modules=len(self.modules),
+        )
+        self.experiment_controller = ExperimentController(
+            backend=self.experiment_backend, calibration=self.length_cal,
+        )
+        self.experiment_panel = ExperimentPanel(
+            self.panel_container,
+            on_start_zero=self._exp_start_zero,
+            on_confirm_zero=self._exp_confirm_zero,
+            on_rezero=self._exp_rezero,
+            on_recalibrate_length=self._exp_recalibrate_length,
+            on_reach=self._exp_reach,
+            on_emergency_stop=self._exp_emergency_stop,
+        )
+        # Rolling yaw history for drift estimation.
+        self._yaw_history = deque(maxlen=600)  # ~60s at 10Hz
 
         # Show default panel
         self.burst_panel.pack(fill="both", expand=True)
@@ -366,6 +401,7 @@ class ArmUI:
         self.burst_panel.pack_forget()
         self.pid_panel.pack_forget()
         self.cal_panel.pack_forget()
+        self.experiment_panel.pack_forget()
 
         mode = self.mode.get()
         if mode == "burst":
@@ -384,6 +420,107 @@ class ArmUI:
                 self.send("CLEAR_LIMITS")
 
             self.cal_panel.pack(fill="both", expand=True)
+        elif mode == "experiments":
+            # Select backend based on serial state.
+            self._refresh_experiment_backend()
+            self.experiment_panel.set_workspace(
+                r_max=self.length_cal.L_max,
+                L_rest=self.length_cal.L_rest,
+                L_max=self.length_cal.L_max,
+                theta_max_rad=1.0472,
+            )
+            self.experiment_panel.pack(fill="both", expand=True)
+
+    # ===========================
+    # EXPERIMENTS
+    # ===========================
+
+    def _refresh_experiment_backend(self):
+        """Swap between LiveBackend and SimBackend based on serial connection state."""
+        from experiment_backend import LiveBackend, SimBackend
+        connected = bool(self.arduino.ser and self.arduino.ser.is_open)
+        if connected and self.experiment_backend.is_sim:
+            self.experiment_backend = LiveBackend(arduino=self.arduino, num_modules=len(self.modules))
+            self.experiment_panel.set_backend_badge("")
+        elif not connected and not self.experiment_backend.is_sim:
+            self.experiment_backend = SimBackend(
+                L_rest=self.length_cal.L_rest, num_modules=len(self.modules),
+            )
+            self.experiment_panel.set_backend_badge("MODE: SIMULATED")
+        elif not connected:
+            # Already sim, just make sure the badge is visible.
+            self.experiment_panel.set_backend_badge("MODE: SIMULATED")
+        self.experiment_controller.backend = self.experiment_backend
+
+    def _exp_start_zero(self):
+        self.experiment_controller.start_zeroing()
+        self.experiment_panel.set_status("Zeroing — confirm trunk is at rest, then Confirm Zero")
+
+    def _exp_confirm_zero(self):
+        self.experiment_controller.confirm_zero()
+        self.experiment_panel.set_status("Zero captured — pick a target")
+
+    def _exp_rezero(self):
+        if self.experiment_controller.rezero():
+            self.experiment_panel.set_status("Re-zeroed at current rest pose")
+        else:
+            self.experiment_panel.set_status("Re-zero blocked — pressures not near rest")
+
+    def _exp_recalibrate_length(self):
+        if not (self.arduino.ser and self.arduino.ser.is_open):
+            self.experiment_panel.set_status("Recalibrate needs a serial connection")
+            return
+        from panels.experiment_calibration import run_length_calibration_dialog
+        live_modules = [
+            mid for mid, psi in self.experiment_backend.read_state().module_pressures_psi.items()
+            if isinstance(psi, (int, float))
+        ]
+        cal = run_length_calibration_dialog(
+            root=self.root,
+            available_modules=live_modules or [m["id"] for m in self.modules],
+            command_pressure=lambda mid, psi: self.experiment_backend.set_module_pressure(mid, psi),
+            wait_for_steady=lambda: self.root.after(1500),
+        )
+        if cal is not None:
+            cal.save(self.length_cal_path)
+            self.length_cal = cal
+            self.experiment_controller.cal = cal
+            self.experiment_panel.set_workspace(
+                r_max=cal.L_max, L_rest=cal.L_rest, L_max=cal.L_max,
+                theta_max_rad=1.0472,
+            )
+            self.experiment_panel.set_status("Length calibration saved")
+
+    def _exp_reach(self, target_display):
+        # Translate target from display frame (zero-relative) to physics frame
+        # (base-relative). Display frame origin = (0, 0, L_rest).
+        tx, ty, tz = target_display
+        target_physics = (tx, ty, tz + self.length_cal.L_rest)
+        try:
+            self.experiment_controller.reach(target_physics)
+            self.experiment_panel.set_status(f"Reaching toward {target_display}")
+            self.experiment_panel.set_target_marker(target_physics)
+        except ValueError as e:
+            self.experiment_panel.set_status(f"Rejected: {e}")
+
+    def _exp_emergency_stop(self):
+        self.experiment_controller.emergency_stop()
+        self.experiment_panel.set_status("EMERGENCY STOP")
+
+    def _yaw_drift_deg_per_min(self, current_yaw_rad: float) -> float:
+        """Estimate yaw drift over the last ~60s as degrees per minute."""
+        import math as _m
+        import time as _t
+        now = _t.monotonic()
+        self._yaw_history.append((now, current_yaw_rad))
+        if len(self._yaw_history) < 2:
+            return 0.0
+        t0, y0 = self._yaw_history[0]
+        dt = now - t0
+        if dt < 5.0:
+            return 0.0
+        drift_rad_per_s = (current_yaw_rad - y0) / dt
+        return _m.degrees(drift_rad_per_s) * 60.0
 
     # ===========================
     # PID CONTROL
@@ -583,10 +720,51 @@ class ArmUI:
             else:
                 self.status.set(line)
 
+            # Route telemetry into the experiments backend when in live mode.
+            if not self.experiment_backend.is_sim:
+                try:
+                    self.experiment_backend.ingest_serial_line(line)
+                except Exception as e:
+                    print(f"[WARN] experiment backend ingest failed: {e}")
+
         try:
             self.graph.draw(self.modules, self.pid_active, self.pid_setpoint_psi)
         except Exception as e:
             print(f"[GRAPH ERROR] {e}")
+
+        # Advance experiment controller ~10Hz (matches update_loop cadence).
+        try:
+            self.experiment_controller.tick(dt=0.1)
+            # Push readouts to the panel - in DISPLAY frame for the pickers,
+            # in both frames for the readout labels.
+            s = self.experiment_backend.read_state()
+            import math as _m
+            from kinematics import forward_kinematics
+            theta_now = _m.hypot(s.pitch, s.roll)
+            phi_now = _m.atan2(s.roll, s.pitch) if theta_now > 1e-9 else 0.0
+            tip_base = forward_kinematics(s.total_length_mm, theta_now, phi_now)
+            tip_zero = (tip_base[0], tip_base[1], tip_base[2] - self.length_cal.L_rest)
+            yaw_drift = self._yaw_drift_deg_per_min(s.yaw)
+            self.experiment_panel.set_readouts(
+                tip_from_zero=tip_zero,
+                tip_from_base=tip_base,
+                pitch=s.pitch, roll=s.roll, yaw=s.yaw,
+                yaw_drift_deg_per_min=yaw_drift,
+                phase=self.experiment_controller.state.value,
+                error_text=(
+                    f"err {_m.degrees(self.experiment_controller.last_result.final_pitch_err_rad):.1f}° / "
+                    f"{self.experiment_controller.last_result.final_position_err_mm:.1f}mm  "
+                    f"in {self.experiment_controller.last_result.elapsed_s:.1f}s"
+                    if self.experiment_controller.last_result else ""
+                ),
+            )
+            # Arc points in DISPLAY frame (subtract L_rest from Z) so pickers render correctly.
+            arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
+            arc_pts_disp = [(p[0], p[1], p[2] - self.length_cal.L_rest) for p in arc_pts_base]
+            self.experiment_panel.set_tip_position(tip_zero, arc_pts_disp)
+        except Exception as e:
+            # Keep the main loop alive even if the experiment panel breaks.
+            print(f"[WARN] experiment tick failed: {e}")
 
         self.root.after(100, self.update_loop)
 
@@ -613,3 +791,9 @@ class ArmUI:
             pass
         self.arduino.close()
         self.root.destroy()
+
+
+def _sample_arc_points(L: float, theta: float, phi: float, n: int = 20):
+    """Sample n+1 points along the PCC arc from base to tip."""
+    from kinematics import forward_kinematics
+    return [forward_kinematics(L * i / n, theta * i / n, phi) for i in range(n + 1)]
