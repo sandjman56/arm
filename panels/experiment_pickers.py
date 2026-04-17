@@ -1,7 +1,16 @@
 """2D matplotlib pickers for Experiments mode — XY top view and XZ side view.
 
-Each picker emits a callback with (x, y) or (x, z) when the user clicks inside
-the reachable region. Clicks outside briefly flash red and are ignored.
+Interaction model (post-revision):
+- XY picker: click (or click + drag) anywhere inside the reachable circle to
+  set (X, Y). A red dot marks the chosen point. Clicks outside the circle
+  briefly flash the frame red and are ignored.
+- XZ picker: GATED on XY-first. Until the user clicks XY, the XZ picker
+  refuses clicks. Once XY is locked, a red dashed guide line appears at the
+  locked X with a red draggable dot at the current Z. Clicking anywhere in
+  the picker snaps the dot's X to the locked X and sets Z to the click's Y.
+  Press + move continuously drags Z while the button is held.
+
+Both pickers fire `_on_pick(x, y)` on every click AND every drag-motion step.
 """
 from __future__ import annotations
 import math
@@ -13,36 +22,58 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 class _BasePicker(tk.Frame):
-    def __init__(self, parent, title: str, width_px: int = 260, height_px: int = 260, **kwargs):
+    """Shared behavior: figure + axes + press/drag/release wiring."""
+
+    def __init__(self, parent, title: str, width_px: int = 240, height_px: int = 240, **kwargs):
         super().__init__(parent, **kwargs)
         self._title = title
+        # Smaller figsize so the canvas can shrink with the window.
         self._fig = Figure(figsize=(width_px / 100, height_px / 100), dpi=100)
         self._ax = self._fig.add_subplot(111)
         self._ax.set_title(title, fontsize=9)
         self._ax.set_aspect("equal", adjustable="box")
         self._canvas = FigureCanvasTkAgg(self._fig, master=self)
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
-        self._canvas.mpl_connect("button_press_event", self._on_click)
+        self._canvas.mpl_connect("button_press_event", self._on_press)
+        self._canvas.mpl_connect("motion_notify_event", self._on_motion)
+        self._canvas.mpl_connect("button_release_event", self._on_release)
         self._on_pick: Optional[Callable[[float, float], None]] = None
+        self._dragging = False
 
     def bind_pick(self, cb: Callable[[float, float], None]) -> None:
         self._on_pick = cb
 
-    def _on_click(self, event) -> None:
+    # --- Event handlers (subclasses override fire()) ---------------------
+
+    def _on_press(self, event) -> None:
         if event.xdata is None or event.ydata is None:
             return
         if not self._is_inside(event.xdata, event.ydata):
             self._flash_invalid()
             return
+        self._dragging = True
+        self._fire(event.xdata, event.ydata)
+
+    def _on_motion(self, event) -> None:
+        if not self._dragging:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if not self._is_inside(event.xdata, event.ydata):
+            return
+        self._fire(event.xdata, event.ydata)
+
+    def _on_release(self, event) -> None:
+        self._dragging = False
+
+    def _fire(self, x: float, y: float) -> None:
         if self._on_pick is not None:
-            self._on_pick(event.xdata, event.ydata)
+            self._on_pick(x, y)
 
     def _is_inside(self, u: float, v: float) -> bool:  # override
         return True
 
     def _flash_invalid(self) -> None:
-        # Draw a momentary red cross at the click; clear on next redraw.
-        # Minimal implementation: change the axis frame color briefly.
         for spine in self._ax.spines.values():
             spine.set_color("red")
         self._canvas.draw_idle()
@@ -56,6 +87,7 @@ class _BasePicker(tk.Frame):
 
 class XYPicker(_BasePicker):
     """Top-down XY picker. `r_max` is the reachable horizontal radius."""
+
     def __init__(self, parent, r_max: float = 400.0, **kwargs):
         super().__init__(parent, title="XY (top view)", **kwargs)
         self._r_max = r_max
@@ -89,13 +121,16 @@ class XYPicker(_BasePicker):
         # Reachable circle.
         circle = plt_circle(0.0, 0.0, self._r_max)
         ax.plot(circle[0], circle[1], linestyle="--", color="#888")
-        # Tip + target markers.
-        ax.plot([self._tip_xy[0]], [self._tip_xy[1]], marker="o", color="#0aa")
-        if self._target_xy is not None:
-            ax.plot([self._target_xy[0]], [self._target_xy[1]],
-                    marker="+", color="#f80", markersize=15)
+        # Axes.
         ax.axhline(0, color="#444", linewidth=0.5)
         ax.axvline(0, color="#444", linewidth=0.5)
+        # Tip marker (teal).
+        ax.plot([self._tip_xy[0]], [self._tip_xy[1]], marker="o", color="#0aa", markersize=7)
+        # Target marker (red filled circle).
+        if self._target_xy is not None:
+            ax.plot([self._target_xy[0]], [self._target_xy[1]],
+                    marker="o", color="red", markersize=9, markeredgecolor="red",
+                    markerfacecolor="red")
         ax.set_xlabel("X (mm)")
         ax.set_ylabel("Y (mm)")
         self._canvas.draw_idle()
@@ -111,7 +146,16 @@ def plt_circle(cx: float, cy: float, r: float, n: int = 64) -> Tuple[list, list]
 
 
 class XZPicker(_BasePicker):
-    """Side view XZ picker with a vertical guide line at locked X."""
+    """Side-view XZ picker.
+
+    Gated: until `set_locked_x(x)` is called (by the panel after the user
+    clicks the XY picker), the picker will not accept clicks or drags.
+    Once locked, a red dashed guide line appears at x=locked_x and a red
+    draggable dot appears on the line at the current Z. The picker snaps
+    X to locked_x regardless of where the user clicks horizontally —
+    only Z moves during drag.
+    """
+
     def __init__(self, parent, L_rest: float = 240.0, L_max: float = 480.0,
                  theta_max_rad: float = math.radians(60), **kwargs):
         super().__init__(parent, title="XZ (side view)", **kwargs)
@@ -120,7 +164,8 @@ class XZPicker(_BasePicker):
         self._theta_max = theta_max_rad
         self._tip_xz: Tuple[float, float] = (0.0, L_rest)
         self._locked_x: Optional[float] = None
-        self._target_xz: Optional[Tuple[float, float]] = None
+        # Current Z of the draggable dot (None if no lock yet).
+        self._dot_z: Optional[float] = None
         self._redraw()
 
     def set_workspace(self, L_rest: float, L_max: float, theta_max_rad: float) -> None:
@@ -134,23 +179,76 @@ class XZPicker(_BasePicker):
         self._redraw()
 
     def set_locked_x(self, x: Optional[float]) -> None:
+        """Lock X (from XY pick) and reset the draggable dot to a default Z.
+
+        The default Z sits on the outer dome at the locked X so the dot is
+        visually in the middle of the reachable height at that X.
+        """
         self._locked_x = x
+        if x is None:
+            self._dot_z = None
+        else:
+            self._dot_z = self._default_z_for(x)
         self._redraw()
 
     def set_target(self, x: Optional[float], z: Optional[float]) -> None:
-        self._target_xz = (x, z) if x is not None and z is not None else None
+        """Programmatic target set (e.g., from text entry or Reach caller)."""
+        if x is None or z is None:
+            self._dot_z = None
+        else:
+            self._locked_x = x
+            self._dot_z = self._clamp_z(x, z)
         self._redraw()
 
-    def _is_inside(self, x: float, z: float) -> bool:
-        # Must lie inside the workspace cross-section AND on the guide line if locked.
-        if self._locked_x is not None and abs(x - self._locked_x) > 2.0:
-            return False
-        # Quick reachability check in XZ: approximate with a dome of radius L_max.
+    def get_current_z(self) -> Optional[float]:
+        return self._dot_z
+
+    # --- Overrides --------------------------------------------------------
+
+    def _on_press(self, event) -> None:
+        if self._locked_x is None:
+            # Gate: user must pick XY first.
+            self._flash_invalid()
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        self._dragging = True
+        self._update_dot_from_y(event.ydata)
+
+    def _on_motion(self, event) -> None:
+        if not self._dragging:
+            return
+        if self._locked_x is None or event.ydata is None:
+            return
+        self._update_dot_from_y(event.ydata)
+
+    def _update_dot_from_y(self, z_raw: float) -> None:
+        assert self._locked_x is not None
+        z = self._clamp_z(self._locked_x, z_raw)
+        self._dot_z = z
+        self._redraw()
+        self._fire(self._locked_x, z)
+
+    # --- Geometry helpers --------------------------------------------------
+
+    def _clamp_z(self, x: float, z: float) -> float:
+        """Clamp z into the reachable half-dome at horizontal position x."""
         if z < 0:
-            return False
-        if math.hypot(x, z) > self._L_max * 1.02:
-            return False
-        return True
+            z = 0.0
+        # Outer bound: sqrt(x^2 + z^2) <= L_max
+        r = self._L_max
+        if x * x + z * z > r * r:
+            # Project onto the dome at this x.
+            z = math.sqrt(max(0.0, r * r - x * x))
+        # Inner bound: L_rest for interior, but clamp softly so it's pickable.
+        # Don't enforce an inner wall here — it would make the dot jumpy.
+        return z
+
+    def _default_z_for(self, x: float) -> float:
+        """Default Z for the red dot after an XY pick: midway of the dome."""
+        # Midpoint between 0 and the outer dome at that x.
+        outer = math.sqrt(max(0.0, self._L_max * self._L_max - x * x))
+        return outer * 0.75  # slightly above midpoint so it's clearly inside
 
     def _redraw(self) -> None:
         ax = self._ax
@@ -160,20 +258,23 @@ class XZPicker(_BasePicker):
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-10, lim)
         ax.set_aspect("equal", adjustable="box")
-        # Reachable dome cross-section: L_min inner arc, L_max outer arc.
+        # Reachable dome cross-section: L_rest inner arc, L_max outer arc.
         inner = _dome_arc(self._L_rest, self._theta_max)
         outer = _dome_arc(self._L_max, self._theta_max)
         ax.plot(inner[0], inner[1], linestyle=":", color="#888")
         ax.plot(outer[0], outer[1], linestyle="--", color="#888")
-        # Tip + guide + target.
-        ax.plot([self._tip_xz[0]], [self._tip_xz[1]], marker="o", color="#0aa")
-        if self._locked_x is not None:
-            ax.axvline(self._locked_x, color="#0aa", linewidth=0.8, linestyle="--")
-        if self._target_xz is not None:
-            ax.plot([self._target_xz[0]], [self._target_xz[1]],
-                    marker="+", color="#f80", markersize=15)
+        # Axes.
         ax.axhline(0, color="#444", linewidth=0.5)
         ax.axvline(0, color="#444", linewidth=0.5)
+        # Current tip (teal).
+        ax.plot([self._tip_xz[0]], [self._tip_xz[1]], marker="o", color="#0aa", markersize=7)
+        # Red guide line + draggable red dot (only after XY is picked).
+        if self._locked_x is not None:
+            ax.axvline(self._locked_x, color="red", linewidth=1.2, linestyle="--")
+            if self._dot_z is not None:
+                ax.plot([self._locked_x], [self._dot_z],
+                        marker="o", color="red", markersize=10,
+                        markeredgecolor="red", markerfacecolor="red")
         ax.set_xlabel("X (mm)")
         ax.set_ylabel("Z (mm)")
         self._canvas.draw_idle()
