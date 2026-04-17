@@ -212,8 +212,9 @@ const int STEP_DELAY_US = 2000;
 String inputBuffer = "";
 
 // =========================
-// PID params (operates on module 0)
+// PID params (per-module)
 // =========================
+// Legacy globals kept so existing `SET <hpa>` (no module id) still works on module 0.
 float SETPOINT_HPA = 0.0;
 float currentPressure = 0.0;
 
@@ -221,6 +222,15 @@ float Kp = 25.0;
 float Ki = 2.0;
 float Kd = 8.0;
 
+// Per-module PID state. Modules with no stepper wired will accept SET commands
+// but the PID loop will no-op for them (stepBurstModule guards on active/idx).
+float currentPressureM[MAX_MODULES] = {0};
+float setpointHpaM[MAX_MODULES]     = {0};
+bool  pidEnabledM[MAX_MODULES]      = {false};
+float integralM[MAX_MODULES]        = {0};
+float lastErrorM[MAX_MODULES]       = {0};
+
+// Legacy shared PID state (module 0 mirror); kept for diagnostics only.
 float integral = 0;
 float lastError = 0;
 
@@ -231,7 +241,17 @@ unsigned long stepInterval = 0;
 unsigned long lastStepTime = 0;
 
 int currentDir = DIR_CCW;
-bool pidEnabled = false;
+bool pidEnabled = false;  // legacy master flag; true iff any pidEnabledM[] is true
+
+// =========================
+// Tendon servos (Experiments mode) — mapped onto existing bend servos A/B/C/D.
+// servo 1 -> A (0°),  2 -> B (90°),  3 -> C (180°),  4 -> D (270°).
+// Pairs 1/3 and 2/4 are antagonists (matches Python LiveBackend mapping).
+// =========================
+// Continuous-rotation interpretation: write(90) = stop;
+// rate in [-1000, +1000] mapped to angle 90 + (rate/1000)*TENDON_MAX_OFFSET_DEG.
+const int TENDON_MAX_OFFSET_DEG = 30;  // gentle bring-up per user selection
+int tendonRate[4] = {0, 0, 0, 0};  // signed -1000..1000; index 0 -> servo 1 -> A
 
 // =========================
 // Timing
@@ -250,6 +270,13 @@ void initModule(int idx, int stepPin, int dirPin) {
   modules[idx].minStepLimit = -999999L;
   modules[idx].maxStepLimit = 999999L;
   modules[idx].limitsActive = false;
+
+  // Per-module PID state.
+  currentPressureM[idx] = 0.0;
+  setpointHpaM[idx]     = 0.0;
+  pidEnabledM[idx]      = false;
+  integralM[idx]        = 0.0;
+  lastErrorM[idx]       = 0.0;
 
   pinMode(stepPin, OUTPUT);
   pinMode(dirPin, OUTPUT);
@@ -412,19 +439,62 @@ void handleCommand(String cmd) {
   // === PID commands ===
 
   if (command == "SET") {
-    float val = args.toFloat();
-    SETPOINT_HPA = val;
-    pidEnabled = true;
-    integral = 0;
-    lastError = 0;
+    // Two forms:
+    //   SET <hpa>            -> legacy, targets module 0 (module id 1)
+    //   SET <mod_id> <hpa>   -> experiments-mode, per-module setpoint (1-based)
+    int sp = args.indexOf(' ');
+    int modIdx = 0;
+    float val = 0.0;
+    if (sp == -1) {
+      // Legacy: single value -> module 0.
+      val = args.toFloat();
+      modIdx = 0;
+    } else {
+      int id = args.substring(0, sp).toInt();
+      val = args.substring(sp + 1).toFloat();
+      if (id < 1 || id > MAX_MODULES) {
+        Serial.print("SET_BAD_MOD ");
+        Serial.println(id);
+        return;
+      }
+      modIdx = id - 1;
+    }
 
-    Serial.print("SETPOINT UPDATED -> ");
-    Serial.println(SETPOINT_HPA);
+    setpointHpaM[modIdx] = val;
+    pidEnabledM[modIdx]  = true;
+    integralM[modIdx]    = 0;
+    lastErrorM[modIdx]   = 0;
+    pidEnabled = true;  // master flag
+
+    // Keep legacy single-module globals in sync when module 0 is targeted.
+    if (modIdx == 0) {
+      SETPOINT_HPA = val;
+      integral = 0;
+      lastError = 0;
+    }
+
+    Serial.print("SETPOINT UPDATED M");
+    Serial.print(modIdx + 1);
+    Serial.print(" -> ");
+    Serial.println(val);
   }
 
   else if (command == "STOP") {
     pidEnabled = false;
     stepInterval = 0;
+    // Clear every per-module PID state.
+    for (int i = 0; i < MAX_MODULES; i++) {
+      pidEnabledM[i] = false;
+      setpointHpaM[i] = 0;
+      integralM[i] = 0;
+      lastErrorM[i] = 0;
+    }
+    // Halt all tendons and release their servo outputs.
+    for (int i = 0; i < 4; i++) tendonRate[i] = 0;
+    if (bendServoA.attached()) bendServoA.detach();
+    if (bendServoB.attached()) bendServoB.detach();
+    if (bendServoC.attached()) bendServoC.detach();
+    if (bendServoD.attached()) bendServoD.detach();
     Serial.println("STOPPED");
   }
 
@@ -570,6 +640,59 @@ void handleCommand(String cmd) {
     stepBurstModule(idx, DIR_CCW);
   }
 
+  // === Tendon command (Experiments mode) ===
+  // TEND <servo_id> <rate>
+  //   servo_id: 1..4 (1->A, 2->B, 3->C, 4->D; pairs 1/3 and 2/4 antagonistic)
+  //   rate:     signed int -1000..+1000
+  // Continuous-rotation servo: write(90) = stop. Rate mapped onto
+  // 90 +/- TENDON_MAX_OFFSET_DEG for gentle bring-up.
+  else if (command == "TEND") {
+    int sp = args.indexOf(' ');
+    if (sp == -1) {
+      Serial.println("TEND_BAD_ARGS");
+      return;
+    }
+    int servoId = args.substring(0, sp).toInt();
+    int rate    = args.substring(sp + 1).toInt();
+    if (servoId < 1 || servoId > 4) {
+      Serial.print("TEND_BAD_SERVO ");
+      Serial.println(servoId);
+      return;
+    }
+    if (rate < -1000) rate = -1000;
+    if (rate >  1000) rate =  1000;
+    tendonRate[servoId - 1] = rate;
+
+    // Map rate -> angle (90 +/- TENDON_MAX_OFFSET_DEG).
+    int offset = (int)((long)rate * TENDON_MAX_OFFSET_DEG / 1000);
+    int angle  = BEND_CENTER_DEG + offset;
+
+    // Select which Servo object backs this tendon.
+    Servo *s = nullptr;
+    int pin = 0;
+    switch (servoId) {
+      case 1: s = &bendServoA; pin = BEND_SERVO_A_PIN; break;
+      case 2: s = &bendServoB; pin = BEND_SERVO_B_PIN; break;
+      case 3: s = &bendServoC; pin = BEND_SERVO_C_PIN; break;
+      case 4: s = &bendServoD; pin = BEND_SERVO_D_PIN; break;
+    }
+
+    if (rate == 0) {
+      // Stop: detach to release the output (CR servos at write(90) still hold).
+      if (s->attached()) s->detach();
+    } else {
+      if (!s->attached()) s->attach(pin);
+      s->write(angle);
+    }
+
+    Serial.print("TEND ");
+    Serial.print(servoId);
+    Serial.print(" rate=");
+    Serial.print(rate);
+    Serial.print(" angle=");
+    Serial.println(angle);
+  }
+
   // === PID gain tuning ===
 
   else if (command == "KP") {
@@ -694,7 +817,9 @@ void loop() {
       Serial.print(",");
       Serial.println(stepPos);
 
-      // Keep module-0 pressure for PID
+      // Store per-module pressure for the per-module PID loop.
+      if (i < MAX_MODULES) currentPressureM[i] = hpa;
+      // Keep legacy module-0 pressure global in sync.
       if (i == 0) currentPressure = hpa;
     }
 
@@ -723,26 +848,39 @@ void loop() {
   }
 
   // =========================
-  // PID LOOP (operates on module 0)
+  // PID LOOP (per-module)
   // =========================
+  // Iterates over every module with pidEnabledM[i] = true, runs a PID step
+  // using that module's setpoint + currentPressureM[i], and bursts its
+  // stepper. Modules without a wired stepper or sensor are simply skipped.
   unsigned long nowUs = micros();
 
   if (pidEnabled && (nowUs - lastPIDTime >= PID_INTERVAL_US)) {
     lastPIDTime = nowUs;
 
-    float error = SETPOINT_HPA - currentPressure;
+    for (int i = 0; i < moduleCount; i++) {
+      if (!pidEnabledM[i]) continue;
+      if (!modules[i].active) continue;
 
-    integral += error * 0.025;
-    float derivative = (error - lastError) / 0.025;
+      float err = setpointHpaM[i] - currentPressureM[i];
 
-    float output = Kp * error + Ki * integral + Kd * derivative;
+      integralM[i] += err * 0.025;
+      float derivative = (err - lastErrorM[i]) / 0.025;
+      float output = Kp * err + Ki * integralM[i] + Kd * derivative;
+      lastErrorM[i] = err;
 
-    lastError = error;
+      if (output > 0) {
+        stepBurstModule(i, DIR_CW);    // inflate
+      } else if (output < 0) {
+        stepBurstModule(i, DIR_CCW);   // deflate
+      }
 
-    if (output > 0) {
-      stepBurst(DIR_CW);    // inflate
-    } else if (output < 0) {
-      stepBurst(DIR_CCW);   // deflate
+      // Keep legacy globals in sync for module 0 observers.
+      if (i == 0) {
+        SETPOINT_HPA = setpointHpaM[0];
+        integral = integralM[0];
+        lastError = lastErrorM[0];
+      }
     }
   }
 }
