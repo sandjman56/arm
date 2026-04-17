@@ -154,3 +154,35 @@ class ExperimentPanel(tk.Frame):
         self.yaw_drift_var.set(f"Yaw drift: {yaw_drift_deg_per_min:.2f}°/min")
         self.phase_var.set(f"Phase: {phase}")
         self.error_var.set(error_text)
+
+    def set_tip_position(self, tip_display: Tuple[float, float, float],
+                         arc_points_display: list) -> None:
+        """Syncs all three canvases. Args are in DISPLAY frame (relative to zero).
+
+        The pickers and the 3D preview all render in display frame so the user
+        picks targets relative to the resting tip (spec §3). The caller
+        (app.py update_loop) converts physics-frame telemetry to display frame
+        before invoking this method.
+        """
+        x, y, z = tip_display
+        self.xy_picker.set_tip(x, y)
+        self.xz_picker.set_tip(x, z)
+        self.preview3d.set_tip_and_arc(tip_display, arc_points_display)
+
+    def set_target_marker(self, target_from_base: Optional[Tuple[float, float, float]]) -> None:
+        if target_from_base is None:
+            self.xy_picker.set_target(None, None)
+            self.xz_picker.set_target(None, None)
+            self.preview3d.set_target(None)
+        else:
+            tx, ty, tz = target_from_base
+            self.xy_picker.set_target(tx, ty)
+            self.xz_picker.set_target(tx, tz)
+            self.preview3d.set_target(target_from_base)
+
+    def set_workspace(self, r_max: float, L_rest: float, L_max: float, theta_max_rad: float) -> None:
+        self.xy_picker.set_r_max(r_max)
+        self.xz_picker.set_workspace(L_rest, L_max, theta_max_rad)
+        self.preview3d._L_max = L_max
+        self.preview3d._theta_max = theta_max_rad
+        self.preview3d._redraw()
