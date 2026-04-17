@@ -56,3 +56,29 @@ def test_fit_module_curve_recovers_quadratic_samples():
 def test_fit_module_curve_requires_at_least_three_samples():
     with pytest.raises(ValueError):
         fit_module_curve([(0.0, 40.0), (8.0, 80.0)])
+
+
+def test_dialog_flow_builds_calibration(monkeypatch, tmp_path):
+    """Drive run_length_calibration_dialog with patched simpledialog."""
+    import panels.experiment_calibration as calmod
+
+    class FakeSD:
+        seq = iter([40.0, 50.0, 60.0, 70.0, 80.0])  # linear length(psi)=40+5*psi
+        @staticmethod
+        def askfloat(*args, **kwargs):
+            return next(FakeSD.seq)
+
+    monkeypatch.setattr(calmod.simpledialog, "askfloat", FakeSD.askfloat)
+    sent = []
+    cal = calmod.run_length_calibration_dialog(
+        root=None,
+        available_modules=[1],
+        command_pressure=lambda mid, psi: sent.append((mid, psi)),
+        wait_for_steady=lambda: None,
+        max_psi=8.0,
+        num_points=5,
+    )
+    assert cal is not None
+    assert 1 in cal.modules
+    assert cal.modules[1]["coeffs"][0] == pytest.approx(40.0, abs=1e-4)
+    assert cal.modules[1]["coeffs"][1] == pytest.approx(5.0, abs=1e-4)
