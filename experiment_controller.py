@@ -60,6 +60,25 @@ class ExperimentController:
         self.state = State.IDLE
         self._target = None
 
+    def stop_reach(self) -> bool:
+        """Graceful stop of an in-progress reach.
+
+        Halts tendons, clears PID (via backend.emergency_stop which sends STOP
+        on live + halts sim), and returns to WAITING_FOR_TARGET so the user can
+        pick a new point without re-zeroing. Returns True if a reach was
+        actually stopped, False if nothing was running.
+        """
+        if self.state not in (State.ELONGATING, State.BENDING):
+            return False
+        self.backend.emergency_stop()
+        self.state = State.WAITING_FOR_TARGET
+        self._target = None
+        return True
+
+    def is_reaching(self) -> bool:
+        """True while a reach is actively in-progress (ELONGATING or BENDING)."""
+        return self.state in (State.ELONGATING, State.BENDING)
+
     @property
     def last_result(self) -> Optional[RunResult]:
         return self._last_result

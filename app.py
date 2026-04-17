@@ -324,10 +324,18 @@ class ArmUI:
             on_rezero=self._exp_rezero,
             on_recalibrate_length=self._exp_recalibrate_length,
             on_reach=self._exp_reach,
+            on_stop_reach=self._exp_stop_reach,
             on_emergency_stop=self._exp_emergency_stop,
         )
         # Rolling yaw history for drift estimation.
         self._yaw_history = deque(maxlen=600)  # ~60s at 10Hz
+        # Dedicated logger for Experiments-mode reach runs. Separate from
+        # self.logger so starting/stopping one doesn't affect the other.
+        self._reach_logger = CSVLogger()
+        # Tracks the phase of the *previous* tick so we can detect when
+        # a run finishes (ELONGATING/BENDING -> REACHED/TIMED_OUT/IDLE)
+        # without polling the controller from two places.
+        self._was_reaching = False
 
         # Show default panel
         self.burst_panel.pack(fill="both", expand=True)
@@ -543,14 +551,45 @@ class ArmUI:
         target_physics = (tx, ty, tz + self.length_cal.L_rest)
         try:
             self.experiment_controller.reach(target_physics)
-            self.experiment_panel.set_status(f"Reaching toward {target_display}")
-            self.experiment_panel.set_target_marker(target_physics)
         except ValueError as e:
             self.experiment_panel.set_status(f"Rejected: {e}")
+            return
+        self.experiment_panel.set_status(f"Reaching toward {target_display}")
+        self.experiment_panel.set_target_marker(target_physics)
+        # Remember the requested target so the log can record it every row.
+        self._reach_target_display = target_display
+        self._reach_target_physics = target_physics
+        # Auto-start the log in LIVE mode only. Sim runs are not logged.
+        if not self.experiment_backend.is_sim:
+            name = self._reach_logger.start(
+                filename_prefix="PointSelect",
+                header=_REACH_LOG_HEADER,
+            )
+            if name:
+                print(f"[REACH LOG] started: {name}")
+
+    def _exp_stop_reach(self):
+        stopped = self.experiment_controller.stop_reach()
+        if stopped:
+            self.experiment_panel.set_status("Reach stopped")
+        # Saving the log is handled in update_loop's finish-detection branch.
 
     def _exp_emergency_stop(self):
         self.experiment_controller.emergency_stop()
         self.experiment_panel.set_status("EMERGENCY STOP")
+        # Save any in-progress reach log immediately. update_loop's
+        # finish-detection will also run next tick, but this ensures the
+        # file is on disk even if something tears down the update loop.
+        self._finalize_reach_log(reason="EMERGENCY STOP")
+
+    def _finalize_reach_log(self, reason: str) -> None:
+        """Stop the reach logger if active and report the saved path."""
+        if not self._reach_logger.is_active:
+            return
+        path = self._reach_logger.stop()
+        if path:
+            print(f"[REACH LOG] saved ({reason}): {path}")
+            self.experiment_panel.set_status(f"Reach log saved: {os.path.basename(path)}")
 
     def _yaw_drift_deg_per_min(self, current_yaw_rad: float) -> float:
         """Estimate yaw drift over the last ~60s as degrees per minute."""
@@ -807,6 +846,46 @@ class ArmUI:
             # frame (preview rendering). Panel handles the frame split.
             arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
             self.experiment_panel.set_tip_position(tip_zero, arc_pts_base)
+
+            # ---- Reach-log bookkeeping -----------------------------------
+            is_reaching = self.experiment_controller.is_reaching()
+            self.experiment_panel.set_stop_reach_enabled(is_reaching)
+
+            # Detect the edge ELONGATING/BENDING -> anything else: the run
+            # just ended (REACHED, TIMED_OUT, or IDLE via stop_reach).
+            if self._was_reaching and not is_reaching:
+                reason = self.experiment_controller.state.value
+                self._finalize_reach_log(reason=reason)
+            self._was_reaching = is_reaching
+
+            # Append a row while the log is open (only happens in live mode).
+            if self._reach_logger.is_active:
+                target = getattr(self, "_reach_target_physics", (None, None, None))
+                last_err = self.experiment_controller.last_result
+                err_text = ""
+                if last_err is not None:
+                    err_text = (
+                        f"pitch_err={_m.degrees(last_err.final_pitch_err_rad):.2f}deg "
+                        f"pos_err={last_err.final_position_err_mm:.1f}mm "
+                        f"timed_out={last_err.timed_out}"
+                    )
+                pressures = s.module_pressures_psi  # {id: psi}
+                psi_cols = [pressures.get(i, "") for i in range(1, 7)]
+                self._reach_logger.log([
+                    target[0] if target[0] is not None else "",
+                    target[1] if target[1] is not None else "",
+                    target[2] if target[2] is not None else "",
+                    f"{tip_base[0]:.3f}",
+                    f"{tip_base[1]:.3f}",
+                    f"{tip_base[2]:.3f}",
+                    f"{_m.degrees(s.pitch):.3f}",
+                    f"{_m.degrees(s.roll):.3f}",
+                    f"{_m.degrees(s.yaw):.3f}",
+                    f"{s.total_length_mm:.2f}",
+                    self.experiment_controller.state.value,
+                    *psi_cols,
+                    err_text,
+                ])
         except Exception as e:
             # Keep the main loop alive even if the experiment panel breaks.
             print(f"[WARN] experiment tick failed: {e}")
@@ -842,3 +921,17 @@ def _sample_arc_points(L: float, theta: float, phi: float, n: int = 20):
     """Sample n+1 points along the PCC arc from base to tip."""
     from kinematics import forward_kinematics
     return [forward_kinematics(L * i / n, theta * i / n, phi) for i in range(n + 1)]
+
+
+# Column header for PointSelect_YYYYMMDD_HHMMSS.csv logs produced by
+# Experiments-mode reach runs. Module pressure columns go up to 6 (one per
+# module); missing sensors record an empty cell.
+_REACH_LOG_HEADER = [
+    "time", "timestamp",
+    "target_x", "target_y", "target_z",
+    "tip_x", "tip_y", "tip_z",
+    "pitch_deg", "roll_deg", "yaw_deg",
+    "total_length_mm", "phase",
+    "psi_1", "psi_2", "psi_3", "psi_4", "psi_5", "psi_6",
+    "error_text",
+]

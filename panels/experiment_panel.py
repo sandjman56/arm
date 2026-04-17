@@ -43,6 +43,7 @@ class ExperimentPanel(tk.Frame):
         on_rezero,
         on_recalibrate_length,
         on_reach,
+        on_stop_reach,
         on_emergency_stop,
         **kwargs,
     ):
@@ -52,6 +53,7 @@ class ExperimentPanel(tk.Frame):
         self._on_rezero = on_rezero
         self._on_recalibrate_length = on_recalibrate_length
         self._on_reach = on_reach
+        self._on_stop_reach = on_stop_reach
         self._on_emergency_stop = on_emergency_stop
 
         # StringVars so the update loop can push values in.
@@ -136,7 +138,14 @@ class ExperimentPanel(tk.Frame):
             tk.Entry(tgt_row, textvariable=var, width=8,
                      font=FONT_DATA).pack(side="left")
         AccentButton(tgt_row, text="Reach", accent=ACCENT_GREEN,
-                     command=self._handle_reach).pack(side="left", padx=15)
+                     command=self._handle_reach).pack(side="left", padx=(15, 3))
+        self._stop_reach_btn = AccentButton(
+            tgt_row, text="Stop Reach", accent=ACCENT_RED,
+            command=self._on_stop_reach,
+        )
+        self._stop_reach_btn.pack(side="left", padx=3)
+        # Stop Reach is disabled until a run is active; app.py toggles it.
+        self._stop_reach_btn.set_state(False)
 
         # --- 3. Canvas row fills whatever is left (shrinks first) ---------
         from panels.experiment_pickers import XYPicker, XZPicker
@@ -230,6 +239,10 @@ class ExperimentPanel(tk.Frame):
 
     def set_backend_badge(self, text: str) -> None:
         self.backend_badge_var.set(text)
+
+    def set_stop_reach_enabled(self, enabled: bool) -> None:
+        """Enable or disable the Stop Reach button. Called by the update loop."""
+        self._stop_reach_btn.set_state(enabled)
 
     def set_readouts(self, tip_from_zero, tip_from_base, pitch, roll, yaw,
                      yaw_drift_deg_per_min, phase, error_text):

@@ -132,6 +132,34 @@ def test_rezero_captures_new_reference(ctrl):
     assert ctrl.rezero() is True  # allowed at rest
 
 
+def test_stop_reach_returns_false_when_idle(ctrl):
+    # No reach has started; stop_reach is a no-op.
+    assert ctrl.stop_reach() is False
+
+
+def test_stop_reach_halts_active_run(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 300.0))
+    ctrl.tick(dt=0.05)
+    assert ctrl.is_reaching() is True
+    assert ctrl.stop_reach() is True
+    assert ctrl.state == State.WAITING_FOR_TARGET
+    assert ctrl.is_reaching() is False
+    # Second call after the stop is a no-op.
+    assert ctrl.stop_reach() is False
+
+
+def test_is_reaching_tracks_phase(ctrl):
+    assert ctrl.is_reaching() is False
+    ctrl.start_zeroing()
+    assert ctrl.is_reaching() is False
+    ctrl.confirm_zero()
+    assert ctrl.is_reaching() is False
+    ctrl.reach(target=(0.0, 0.0, 300.0))
+    assert ctrl.is_reaching() is True  # ELONGATING
+
+
 def test_bending_aborts_on_stale_IMU_in_live_mode():
     """If read_state().imu_fresh is False during BENDING, controller must halt."""
     from experiment_backend import BackendState
