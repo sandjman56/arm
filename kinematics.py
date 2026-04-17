@@ -30,3 +30,37 @@ def forward_kinematics(L: float, theta: float, phi: float) -> Vec3:
     x = r_plane * math.cos(phi)
     y = r_plane * math.sin(phi)
     return (x, y, z)
+
+
+class Unreachable(ValueError):
+    """Raised when a target cannot be reached by any valid (L, theta, phi)."""
+
+
+def inverse_kinematics(target: Vec3) -> Tuple[float, float, float]:
+    """Return (L, theta, phi) such that forward_kinematics(L, theta, phi) == target.
+
+    Raises Unreachable if the target is outside the representable half-space.
+    """
+    x, y, z = target
+    if z < 0:
+        raise Unreachable(f"target {target} has z < 0; arc cannot reach below base")
+
+    phi = math.atan2(y, x)
+    r = math.hypot(x, y)  # horizontal distance from Z axis
+
+    # Degenerate: target on Z axis => straight trunk
+    if r < 1e-9:
+        if z <= 0:
+            raise Unreachable(f"target {target} on Z axis with z<=0")
+        return (z, 0.0, 0.0)
+
+    # Planar geometry: tip at (r, z). For a PCC arc rooted at origin with
+    # initial tangent +Z and radius R, the tip lies at (R*(1-cos t), R*sin t).
+    # So: r = R*(1-cos t), z = R*sin t => r^2 + z^2 = 2*R*r (from identity
+    # (1-cos)^2 + sin^2 = 2(1-cos)), giving R = (r^2 + z^2) / (2r).
+    R = (r * r + z * z) / (2.0 * r)
+    # theta from z = R*sin(theta), clamp for numerical safety.
+    sin_t = max(-1.0, min(1.0, z / R))
+    theta = math.asin(sin_t)
+    L = R * theta
+    return (L, theta, phi)

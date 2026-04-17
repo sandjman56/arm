@@ -40,3 +40,34 @@ def test_small_theta_is_continuous_with_straight():
 def test_negative_L_raises():
     with pytest.raises(ValueError):
         forward_kinematics(L=-1.0, theta=0.0, phi=0.0)
+
+
+from kinematics import inverse_kinematics, Unreachable
+
+
+def test_inverse_straight_up():
+    """Target directly above base recovers L = z, theta = 0."""
+    L, theta, phi = inverse_kinematics((0.0, 0.0, 100.0))
+    assert L == pytest.approx(100.0, abs=1e-6)
+    assert theta == pytest.approx(0.0, abs=1e-6)
+
+
+def test_inverse_round_trip_in_xz():
+    """FK(IK(target)) == target for a reachable point."""
+    target = (50.0, 0.0, 80.0)
+    L, theta, phi = inverse_kinematics(target)
+    tip = forward_kinematics(L, theta, phi)
+    assert tip == pytest.approx(target, abs=1e-4)
+
+
+def test_inverse_round_trip_arbitrary_azimuth():
+    target = (30.0, 40.0, 70.0)
+    L, theta, phi = inverse_kinematics(target)
+    tip = forward_kinematics(L, theta, phi)
+    assert tip == pytest.approx(target, abs=1e-4)
+
+
+def test_inverse_rejects_point_below_base():
+    """The arc can't reach z < 0 (modeled trunk only tilts up to 90 deg)."""
+    with pytest.raises(Unreachable):
+        inverse_kinematics((10.0, 0.0, -5.0))
