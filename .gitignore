@@ -22,6 +22,7 @@ htmlcov/
 # Project-local
 .claude/
 .superpowers/
+.worktrees/
 logger/*.csv
 calibration.json
 length_calibration.json
