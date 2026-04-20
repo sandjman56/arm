@@ -802,50 +802,96 @@ void handleCommand(String cmd) {
     Serial.println(Kd);
   }
 
-  // === Calibration commands (operate on module 0) ===
+  // === Calibration commands (per-module, 1-indexed) ===
+  // Every command below accepts an optional module ID (1..moduleCount) as its
+  // first arg. Omitting it (or passing an out-of-range value) defaults to
+  // Module 1, preserving the legacy single-module protocol.
+  //   RESET_POS            RESET_POS,<mod>
+  //   SET_MIN              SET_MIN,<mod>
+  //   SET_MAX              SET_MAX,<mod>
+  //   CLEAR_LIMITS         CLEAR_LIMITS,<mod>
+  //   GET_POS              GET_POS,<mod>
+  //   SET_LIMITS <min>,<max>        (legacy, Module 1)
+  //   SET_LIMITS <mod>,<min>,<max>  (per-module)
 
   else if (command == "RESET_POS") {
-    modules[0].stepPosition = 0;
-    Serial.println("POS_RESET 0");
+    int idx = parseModuleIdx(args);
+    modules[idx].stepPosition = 0;
+    Serial.print("POS_RESET M");
+    Serial.println(idx + 1);
   }
 
   else if (command == "SET_MIN") {
-    modules[0].minStepLimit = modules[0].stepPosition;
-    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
-    Serial.print("MIN_SET ");
-    Serial.println(modules[0].minStepLimit);
+    int idx = parseModuleIdx(args);
+    modules[idx].minStepLimit = modules[idx].stepPosition;
+    modules[idx].limitsActive = (modules[idx].minStepLimit != -999999L || modules[idx].maxStepLimit != 999999L);
+    Serial.print("MIN_SET M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].minStepLimit);
   }
 
   else if (command == "SET_MAX") {
-    modules[0].maxStepLimit = modules[0].stepPosition;
-    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
-    Serial.print("MAX_SET ");
-    Serial.println(modules[0].maxStepLimit);
+    int idx = parseModuleIdx(args);
+    modules[idx].maxStepLimit = modules[idx].stepPosition;
+    modules[idx].limitsActive = (modules[idx].minStepLimit != -999999L || modules[idx].maxStepLimit != 999999L);
+    Serial.print("MAX_SET M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].maxStepLimit);
   }
 
   else if (command == "SET_LIMITS") {
-    int commaPos = args.indexOf(',');
-    if (commaPos != -1) {
-      modules[0].minStepLimit = args.substring(0, commaPos).toInt();
-      modules[0].maxStepLimit = args.substring(commaPos + 1).toInt();
-      modules[0].limitsActive = true;
-      Serial.print("LIMITS_SET ");
-      Serial.print(modules[0].minStepLimit);
+    int firstComma  = args.indexOf(',');
+    int secondComma = (firstComma != -1) ? args.indexOf(',', firstComma + 1) : -1;
+    if (firstComma != -1) {
+      int idx;
+      long minVal;
+      long maxVal;
+      if (secondComma != -1) {
+        // New 3-arg form: <mod>,<min>,<max>
+        int id = args.substring(0, firstComma).toInt();
+        if (id < 1 || id > moduleCount) {
+          Serial.print("SET_LIMITS_BAD_MOD ");
+          Serial.println(id);
+          return;
+        }
+        idx    = id - 1;
+        minVal = args.substring(firstComma + 1, secondComma).toInt();
+        maxVal = args.substring(secondComma + 1).toInt();
+      } else {
+        // Legacy 2-arg form: <min>,<max> targets Module 1
+        idx    = 0;
+        minVal = args.substring(0, firstComma).toInt();
+        maxVal = args.substring(firstComma + 1).toInt();
+      }
+      modules[idx].minStepLimit = minVal;
+      modules[idx].maxStepLimit = maxVal;
+      modules[idx].limitsActive = true;
+      Serial.print("LIMITS_SET M");
+      Serial.print(idx + 1);
+      Serial.print(" ");
+      Serial.print(modules[idx].minStepLimit);
       Serial.print(",");
-      Serial.println(modules[0].maxStepLimit);
+      Serial.println(modules[idx].maxStepLimit);
     }
   }
 
   else if (command == "CLEAR_LIMITS") {
-    modules[0].limitsActive = false;
-    modules[0].minStepLimit = -999999L;
-    modules[0].maxStepLimit = 999999L;
-    Serial.println("LIMITS_CLEARED");
+    int idx = parseModuleIdx(args);
+    modules[idx].limitsActive = false;
+    modules[idx].minStepLimit = -999999L;
+    modules[idx].maxStepLimit = 999999L;
+    Serial.print("LIMITS_CLEARED M");
+    Serial.println(idx + 1);
   }
 
   else if (command == "GET_POS") {
-    Serial.print("POS ");
-    Serial.println(modules[0].stepPosition);
+    int idx = parseModuleIdx(args);
+    Serial.print("POS M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].stepPosition);
   }
 
   else {
