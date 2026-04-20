@@ -803,6 +803,24 @@ class ArmUI:
                     except (ValueError, IndexError):
                         pass
 
+            # Per-module step position: POS,module_id,steps
+            # Sent for every wired module regardless of pressure sensor
+            # presence, so modules without a sensor still see live position.
+            elif line.startswith("POS,"):
+                parts = line.split(",")
+                if len(parts) >= 3:
+                    try:
+                        mod_id = int(parts[1])
+                        pos = int(parts[2])
+                        for mod in self.modules:
+                            if mod["id"] == mod_id:
+                                mod["step_position"].set(pos)
+                                self.stepper_bar.set_position(mod_id, pos)
+                                self.cal_panel.set_position(mod_id, pos)
+                                break
+                    except (ValueError, IndexError):
+                        pass
+
             # Legacy single-sensor: P,time_ms,hPa,psi[,pos]
             elif line.startswith("P,"):
                 parts = line.split(",")

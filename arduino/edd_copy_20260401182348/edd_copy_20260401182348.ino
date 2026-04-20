@@ -960,6 +960,17 @@ void loop() {
       if (i == 0) currentPressure = hpa;
     }
 
+    // Stream step position for every wired module, independent of pressure
+    // sensor presence. Modules without a pressure sensor still need their
+    // stepper position visible on the GUI so calibration can work.
+    for (int i = 0; i < moduleCount; i++) {
+      if (!modules[i].active) continue;
+      Serial.print("POS,");
+      Serial.print(i + 1);
+      Serial.print(",");
+      Serial.println(modules[i].stepPosition);
+    }
+
     // Read and stream IMU data
     if (imuPresent) {
       tcaselect(IMU_CHANNEL);
