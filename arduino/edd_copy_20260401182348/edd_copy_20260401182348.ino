@@ -193,11 +193,13 @@ Adafruit_MPRLS mpr = Adafruit_MPRLS();
 #define MAX_MODULES 8
 
 // Pressure sensor channel mapping (via PCA9548A mux)
-#define NUM_PRESSURE_SENSORS 3
-uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3};
+#define NUM_PRESSURE_SENSORS 5
+uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3, 4, 5};
 // index 0 -> Module 1 on ch 1 (SD1/SC1)
 // index 1 -> Module 2 on ch 0 (SD0/SC0)
 // index 2 -> Module 3 on ch 3 (SD3/SC3)
+// index 3 -> Module 4 on ch 4 (SD4/SC4)
+// index 4 -> Module 5 on ch 5 (SD5/SC5)
 bool    pressurePresent[MAX_MODULES]  = {false};
 
 struct Module {
