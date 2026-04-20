@@ -52,9 +52,10 @@ class ArmUI:
         self.graph_max_points = 200
 
         # Calibration state
-        self.step_position = 0
-        self.cal_back_wall = None
-        self.cal_front_wall = None
+        # Per-module step-position limits, keyed by 1-indexed module_id:
+        #   self.cal_limits[mid] = {"back": int, "front": int}
+        self.step_position = 0  # legacy: last-seen position from P, telemetry
+        self.cal_limits = {}
         self.cal_file = os.path.join(os.path.dirname(__file__) or ".", "calibration.json")
         self.calibration_loaded = False
         self._load_calibration_from_disk()
@@ -77,7 +78,7 @@ class ArmUI:
         MODULE_CONFIG = [
             ("Module 1", 3, 4),
             ("Module 2", 8, 7),
-            ("Module 3", None, None),
+            ("Module 3", 30, 28),
             ("Module 4", None, None),
             ("Module 5", None, None),
             ("Module 6", None, None),
@@ -298,9 +299,16 @@ class ArmUI:
             self.start_pid, self.stop_pid, self.emergency_stop)
 
         self.cal_panel = CalibrationPanel(
-            self.panel_container, self.send,
-            self.cal_set_back, self.cal_set_front,
-            self.cal_save, self.cal_clear, self.emergency_stop)
+            self.panel_container,
+            modules=self._wired_modules(),
+            on_send=self.send,
+            on_set_back=self.cal_set_back,
+            on_set_front=self.cal_set_front,
+            on_save=self.cal_save,
+            on_clear=self.cal_clear,
+            on_module_change=self._cal_on_module_change,
+            on_emergency_stop=self.emergency_stop,
+        )
 
         # Experiments mode: backend + controller + panel.
         from length_calibration import load_or_default
@@ -454,16 +462,21 @@ class ArmUI:
         elif mode == "pid":
             self.pid_panel.pack(fill="both", expand=True)
         elif mode == "calibration":
-            self.send("RESET_POS")
+            # Reset each wired module's stepper position and either push its
+            # saved limits to firmware or clear any stale limits for modules
+            # that have not been calibrated yet.
+            for mod in self._wired_modules():
+                mid = mod["id"]
+                self.send(f"RESET_POS,{mid}")
+                mod["step_position"].set(0)
+                lim = self.cal_limits.get(mid)
+                if lim is not None:
+                    self.send(f"SET_LIMITS {mid},{lim['back']},{lim['front']}")
+                else:
+                    self.send(f"CLEAR_LIMITS,{mid}")
             self.step_position = 0
-
-            if self.cal_back_wall is not None and self.cal_front_wall is not None:
-                self.cal_panel.set_limits_display(self.cal_back_wall, self.cal_front_wall)
-                self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
-            else:
-                self.cal_panel.clear_display()
-                self.send("CLEAR_LIMITS")
-
+            # Refresh the panel for whichever module the user has selected.
+            self._cal_on_module_change(self.cal_panel.selected_module_id.get())
             self.cal_panel.pack(fill="both", expand=True)
         elif mode == "experiments":
             # Select backend based on serial state.
@@ -603,57 +616,93 @@ class ArmUI:
     # ===========================
     # CALIBRATION
     # ===========================
-    def cal_set_back(self):
-        self.cal_back_wall = self.step_position
-        self.send("SET_MIN")
-        self.cal_panel.cal_back_var.set(f"Back wall: {self.cal_back_wall} steps")
-        self._cal_check_ready()
+    def _wired_modules(self):
+        """Return module dicts whose stepper pins are wired (non-None)."""
+        return [m for m in self.modules if m["step_pin"] is not None and m["dir_pin"] is not None]
 
-    def cal_set_front(self):
-        self.cal_front_wall = self.step_position
-        self.send("SET_MAX")
-        self.cal_panel.cal_front_var.set(f"Front wall: {self.cal_front_wall} steps")
-        self._cal_check_ready()
+    def _module_step_position(self, module_id):
+        for m in self.modules:
+            if m["id"] == module_id:
+                return int(m["step_position"].get())
+        return 0
 
-    def _cal_check_ready(self):
-        if self.cal_back_wall is not None and self.cal_front_wall is not None:
-            if self.cal_back_wall < self.cal_front_wall:
-                rng = self.cal_front_wall - self.cal_back_wall
-                self.cal_panel.cal_range_var.set(f"{rng} steps")
+    def _cal_on_module_change(self, module_id):
+        """Refresh the panel's back/front/range/position for the newly-selected module."""
+        pos = self._module_step_position(module_id)
+        self.cal_panel.cal_pos_var.set(f"{pos}")
+        lim = self.cal_limits.get(module_id)
+        if lim is not None:
+            self.cal_panel.set_limits_display(module_id, lim["back"], lim["front"])
+        else:
+            self.cal_panel.clear_display(module_id)
+
+    def cal_set_back(self, module_id):
+        pos = self._module_step_position(module_id)
+        entry = self.cal_limits.setdefault(module_id, {"back": None, "front": None})
+        entry["back"] = pos
+        self.send(f"SET_MIN,{module_id}")
+        self.cal_panel.cal_back_var.set(f"Back wall: {pos} steps")
+        self._cal_check_ready(module_id)
+
+    def cal_set_front(self, module_id):
+        pos = self._module_step_position(module_id)
+        entry = self.cal_limits.setdefault(module_id, {"back": None, "front": None})
+        entry["front"] = pos
+        self.send(f"SET_MAX,{module_id}")
+        self.cal_panel.cal_front_var.set(f"Front wall: {pos} steps")
+        self._cal_check_ready(module_id)
+
+    def _cal_check_ready(self, module_id):
+        lim = self.cal_limits.get(module_id) or {}
+        back = lim.get("back")
+        front = lim.get("front")
+        if back is not None and front is not None:
+            if back < front:
+                self.cal_panel.cal_range_var.set(f"{front - back} steps")
                 self.cal_panel.enable_save(True)
             else:
                 self.cal_panel.cal_range_var.set("Error: back must be < front")
                 self.cal_panel.enable_save(False)
 
     def cal_save(self):
-        if self.cal_back_wall is None or self.cal_front_wall is None:
+        # Only save modules whose back+front are both set and valid.
+        payload = {}
+        for mid, lim in self.cal_limits.items():
+            back = lim.get("back")
+            front = lim.get("front")
+            if back is None or front is None or back >= front:
+                continue
+            payload[str(mid)] = {"back": back, "front": front}
+        if not payload:
             return
-        cal_data = {
-            "back_wall": self.cal_back_wall,
-            "front_wall": self.cal_front_wall,
-        }
+        cal_data = {"modules": payload}
         try:
             with open(self.cal_file, "w") as f:
                 json.dump(cal_data, f, indent=2)
             self.calibration_loaded = True
-            self.status.set(f"CALIBRATION SAVED: [{self.cal_back_wall}, {self.cal_front_wall}]")
+            summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]" for mid, v in payload.items())
+            self.status.set(f"CALIBRATION SAVED: {summary}")
         except Exception as e:
             self.status.set(f"Error saving calibration: {e}")
 
-    def cal_clear(self):
-        self.send("CLEAR_LIMITS")
-        self.cal_back_wall = None
-        self.cal_front_wall = None
-        self.cal_panel.clear_display()
-        self.calibration_loaded = False
-
-        if os.path.exists(self.cal_file):
-            try:
+    def cal_clear(self, module_id):
+        """Clear limits for a single module (the one currently selected in the panel)."""
+        self.send(f"CLEAR_LIMITS,{module_id}")
+        self.cal_limits.pop(module_id, None)
+        self.cal_panel.clear_display(module_id)
+        # Rewrite the on-disk file so this module is removed from persistence.
+        try:
+            if self.cal_limits:
+                payload = {str(mid): dict(v) for mid, v in self.cal_limits.items()
+                           if v.get("back") is not None and v.get("front") is not None}
+                with open(self.cal_file, "w") as f:
+                    json.dump({"modules": payload}, f, indent=2)
+            elif os.path.exists(self.cal_file):
                 os.remove(self.cal_file)
-            except Exception as e:
-                print(f"[WARN] Could not delete calibration file: {e}")
-
-        self.status.set("LIMITS CLEARED")
+        except Exception as e:
+            print(f"[WARN] Could not update calibration file: {e}")
+        self.calibration_loaded = bool(self.cal_limits)
+        self.status.set(f"LIMITS CLEARED M{module_id}")
 
     def _load_calibration_from_disk(self):
         if not os.path.exists(self.cal_file):
@@ -661,25 +710,43 @@ class ArmUI:
         try:
             with open(self.cal_file, "r") as f:
                 cal_data = json.load(f)
+        except Exception as e:
+            print(f"[WARN] Could not load calibration: {e}")
+            return
+        # New format: {"modules": {"1": {"back": x, "front": y}, ...}}
+        modules_dict = cal_data.get("modules")
+        if isinstance(modules_dict, dict):
+            for mid_str, lim in modules_dict.items():
+                try:
+                    mid = int(mid_str)
+                    back = int(lim["back"])
+                    front = int(lim["front"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                self.cal_limits[mid] = {"back": back, "front": front}
+        else:
+            # Legacy flat format: {"back_wall": X, "front_wall": Y} → Module 1
             back = cal_data.get("back_wall")
             front = cal_data.get("front_wall")
             if back is not None and front is not None:
-                self.cal_back_wall = back
-                self.cal_front_wall = front
-                self.calibration_loaded = True
-                print(f"[INFO] Calibration loaded from disk: [{back}, {front}]")
-        except Exception as e:
-            print(f"[WARN] Could not load calibration: {e}")
+                self.cal_limits[1] = {"back": int(back), "front": int(front)}
+        if self.cal_limits:
+            self.calibration_loaded = True
+            summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]"
+                                for mid, v in sorted(self.cal_limits.items()))
+            print(f"[INFO] Calibration loaded from disk: {summary}")
 
     def load_calibration(self):
-        if self.cal_back_wall is not None and self.cal_front_wall is not None:
-            self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
-            self.status.set(f"CALIBRATION LOADED: [{self.cal_back_wall}, {self.cal_front_wall}]")
-        elif os.path.exists(self.cal_file):
+        """Push all saved per-module limits to firmware after a fresh connect."""
+        if not self.cal_limits and os.path.exists(self.cal_file):
             self._load_calibration_from_disk()
-            if self.cal_back_wall is not None and self.cal_front_wall is not None:
-                self.send(f"SET_LIMITS {self.cal_back_wall},{self.cal_front_wall}")
-                self.status.set(f"CALIBRATION LOADED: [{self.cal_back_wall}, {self.cal_front_wall}]")
+        if not self.cal_limits:
+            return
+        for mid, lim in self.cal_limits.items():
+            self.send(f"SET_LIMITS {mid},{lim['back']},{lim['front']}")
+        summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]"
+                            for mid, v in sorted(self.cal_limits.items()))
+        self.status.set(f"CALIBRATION LOADED: {summary}")
 
     # ===========================
     # UPDATE LOOP
@@ -709,6 +776,7 @@ class ArmUI:
                                         pos = int(parts[5])
                                         mod["step_position"].set(pos)
                                         self.stepper_bar.set_position(mod_id, pos)
+                                        self.cal_panel.set_position(mod_id, pos)
                                     except ValueError:
                                         pass
                                 break
@@ -735,9 +803,10 @@ class ArmUI:
                             pos = int(parts[4])
                             self.step_position = pos
                             if self.modules:
-                                self.modules[0]["step_position"].set(pos)
-                                self.stepper_bar.set_position(self.modules[0]["id"], pos)
-                            self.cal_panel.set_position(pos)
+                                mod0 = self.modules[0]
+                                mod0["step_position"].set(pos)
+                                self.stepper_bar.set_position(mod0["id"], pos)
+                                self.cal_panel.set_position(mod0["id"], pos)
                         except ValueError:
                             pass
 
