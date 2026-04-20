@@ -26,3 +26,4 @@ htmlcov/
 logger/*.csv
 calibration.json
 length_calibration.json
+graphify-out/

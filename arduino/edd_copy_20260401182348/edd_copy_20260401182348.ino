@@ -17,7 +17,7 @@ struct MPUData {
 #define BEND_SERVO_A_PIN 9   // XY left
 #define BEND_SERVO_B_PIN 10  // XY right
 #define BEND_SERVO_C_PIN 11  // XZ left
-#define BEND_SERVO_D_PIN 12  // XZ right
+#define BEND_SERVO_D_PIN 24  // XZ right
 
 // Neutral angle and max deflection (degrees)
 #define BEND_CENTER_DEG 90
@@ -30,6 +30,19 @@ Servo bendServoD;
 int bendValue = 0;    // XY -100..100
 int bendValueXZ = 0;  // XZ -100..100
 int bendValueAll = 0; // All servos -100..100
+
+// Running center per servo. Shifts on CENTER (v=0) to latch the last commanded
+// angle, so subsequent slider moves are incremental from the held position
+// rather than snapping back to BEND_CENTER_DEG.
+int centerAngleA = BEND_CENTER_DEG;
+int centerAngleB = BEND_CENTER_DEG;
+int centerAngleC = BEND_CENTER_DEG;
+int centerAngleD = BEND_CENTER_DEG;
+// Last angle each servo was commanded to (source for the center latch).
+int lastAngleA = BEND_CENTER_DEG;
+int lastAngleB = BEND_CENTER_DEG;
+int lastAngleC = BEND_CENTER_DEG;
+int lastAngleD = BEND_CENTER_DEG;
 
 // =========================
 // I2C Multiplexer (PCA9548A)
@@ -180,11 +193,13 @@ Adafruit_MPRLS mpr = Adafruit_MPRLS();
 #define MAX_MODULES 8
 
 // Pressure sensor channel mapping (via PCA9548A mux)
-#define NUM_PRESSURE_SENSORS 3
-uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3};
+#define NUM_PRESSURE_SENSORS 5
+uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3, 4, 5};
 // index 0 -> Module 1 on ch 1 (SD1/SC1)
 // index 1 -> Module 2 on ch 0 (SD0/SC0)
 // index 2 -> Module 3 on ch 3 (SD3/SC3)
+// index 3 -> Module 4 on ch 4 (SD4/SC4)
+// index 4 -> Module 5 on ch 5 (SD5/SC5)
 bool    pressurePresent[MAX_MODULES]  = {false};
 
 struct Module {
@@ -234,6 +249,9 @@ float setpointHpaM[MAX_MODULES]     = {0};
 bool  pidEnabledM[MAX_MODULES]      = {false};
 float integralM[MAX_MODULES]        = {0};
 float lastErrorM[MAX_MODULES]       = {0};
+// Set true once PID has emitted a "blocked, no limits calibrated" warning for
+// this module, so the warning fires at most once per pid-enable cycle.
+bool  pidLimitWarned[MAX_MODULES]   = {false};
 
 // Legacy shared PID state (module 0 mirror); kept for diagnostics only.
 float integral = 0;
@@ -304,9 +322,11 @@ void setup() {
   digitalWrite(EN_PIN, LOW);  // ENABLE DRIVER
 
   // Default Module 1: STEP=3, DIR=4 (matches original wiring)
+  // Module 3: STEP=30, DIR=28
   initModule(0, 3, 4);
   initModule(1, 8, 7);
-  moduleCount = 2;
+  initModule(2, 30, 28);
+  moduleCount = 3;
 
   // Bend servos start detached (no power) — attached on demand by BEND command
   pinMode(BEND_SERVO_A_PIN, OUTPUT);
@@ -504,6 +524,7 @@ void handleCommand(String cmd) {
     pidEnabledM[modIdx]  = true;
     integralM[modIdx]    = 0;
     lastErrorM[modIdx]   = 0;
+    pidLimitWarned[modIdx] = false;
     pidEnabled = true;  // master flag
 
     // Keep legacy single-module globals in sync when module 0 is targeted.
@@ -568,22 +589,30 @@ void handleCommand(String cmd) {
     // Slider left (v<0) -> drive A, detach B. Slider right (v>0) -> drive B, detach A.
     int mag = v < 0 ? -v : v;
     int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleA = BEND_CENTER_DEG;
-    int angleB = BEND_CENTER_DEG;
+    int angleA = centerAngleA;
+    int angleB = centerAngleB;
 
     if (v < 0) {
       if (bendServoB.attached()) bendServoB.detach();
       if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
-      angleA = BEND_CENTER_DEG + offset;
+      angleA = constrain(centerAngleA + offset, 0, 180);
       bendServoA.write(angleA);
+      lastAngleA = angleA;
     } else if (v > 0) {
       if (bendServoA.attached()) bendServoA.detach();
       if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
-      angleB = BEND_CENTER_DEG + offset;
+      angleB = constrain(centerAngleB + offset, 0, 180);
       bendServoB.write(angleB);
+      lastAngleB = angleB;
     } else {
-      if (bendServoA.attached()) bendServoA.detach();
-      if (bendServoB.attached()) bendServoB.detach();
+      // Latch last commanded angles as new centers. Keep the active servo
+      // attached and holding; do not detach on center.
+      centerAngleA = lastAngleA;
+      centerAngleB = lastAngleB;
+      if (bendServoA.attached()) bendServoA.write(lastAngleA);
+      if (bendServoB.attached()) bendServoB.write(lastAngleB);
+      angleA = lastAngleA;
+      angleB = lastAngleB;
     }
 
     Serial.print("BEND ");
@@ -607,22 +636,30 @@ void handleCommand(String cmd) {
 
     int mag = v < 0 ? -v : v;
     int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleC = BEND_CENTER_DEG;
-    int angleD = BEND_CENTER_DEG;
+    int angleC = centerAngleC;
+    int angleD = centerAngleD;
 
     if (v < 0) {
       if (bendServoD.attached()) bendServoD.detach();
       if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
-      angleC = BEND_CENTER_DEG + offset;
+      angleC = constrain(centerAngleC + offset, 0, 180);
       bendServoC.write(angleC);
+      lastAngleC = angleC;
     } else if (v > 0) {
       if (bendServoC.attached()) bendServoC.detach();
       if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
-      angleD = BEND_CENTER_DEG + offset;
+      angleD = constrain(centerAngleD + offset, 0, 180);
       bendServoD.write(angleD);
+      lastAngleD = angleD;
     } else {
-      if (bendServoC.attached()) bendServoC.detach();
-      if (bendServoD.attached()) bendServoD.detach();
+      // Latch last commanded angles as new centers. Keep the active servo
+      // attached and holding; do not detach on center.
+      centerAngleC = lastAngleC;
+      centerAngleD = lastAngleD;
+      if (bendServoC.attached()) bendServoC.write(lastAngleC);
+      if (bendServoD.attached()) bendServoD.write(lastAngleD);
+      angleC = lastAngleC;
+      angleD = lastAngleD;
     }
 
     Serial.print("BEND_XZ ");
@@ -646,24 +683,37 @@ void handleCommand(String cmd) {
 
     int allAngle = BEND_CENTER_DEG;
     if (v == 0) {
-      if (bendServoA.attached()) bendServoA.detach();
-      if (bendServoB.attached()) bendServoB.detach();
-      if (bendServoC.attached()) bendServoC.detach();
-      if (bendServoD.attached()) bendServoD.detach();
+      // Latch each servo's last commanded angle as its new center. Keep
+      // whichever servos are attached holding their positions.
+      centerAngleA = lastAngleA;
+      centerAngleB = lastAngleB;
+      centerAngleC = lastAngleC;
+      centerAngleD = lastAngleD;
+      if (bendServoA.attached()) bendServoA.write(lastAngleA);
+      if (bendServoB.attached()) bendServoB.write(lastAngleB);
+      if (bendServoC.attached()) bendServoC.write(lastAngleC);
+      if (bendServoD.attached()) bendServoD.write(lastAngleD);
+      allAngle = lastAngleA;
     } else {
       int mag = v < 0 ? -v : v;
       int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-      allAngle = (v > 0) ? (BEND_CENTER_DEG + offset) : (BEND_CENTER_DEG - offset);
+      int signedOffset = (v > 0) ? offset : -offset;
 
       if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
       if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
       if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
       if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
 
-      bendServoA.write(allAngle);
-      bendServoB.write(allAngle);
-      bendServoC.write(allAngle);
-      bendServoD.write(allAngle);
+      int aA = constrain(centerAngleA + signedOffset, 0, 180);
+      int aB = constrain(centerAngleB + signedOffset, 0, 180);
+      int aC = constrain(centerAngleC + signedOffset, 0, 180);
+      int aD = constrain(centerAngleD + signedOffset, 0, 180);
+
+      bendServoA.write(aA); lastAngleA = aA;
+      bendServoB.write(aB); lastAngleB = aB;
+      bendServoC.write(aC); lastAngleC = aC;
+      bendServoD.write(aD); lastAngleD = aD;
+      allAngle = aA;
     }
 
     Serial.print("BEND_ALL ");
@@ -754,50 +804,96 @@ void handleCommand(String cmd) {
     Serial.println(Kd);
   }
 
-  // === Calibration commands (operate on module 0) ===
+  // === Calibration commands (per-module, 1-indexed) ===
+  // Every command below accepts an optional module ID (1..moduleCount) as its
+  // first arg. Omitting it (or passing an out-of-range value) defaults to
+  // Module 1, preserving the legacy single-module protocol.
+  //   RESET_POS            RESET_POS,<mod>
+  //   SET_MIN              SET_MIN,<mod>
+  //   SET_MAX              SET_MAX,<mod>
+  //   CLEAR_LIMITS         CLEAR_LIMITS,<mod>
+  //   GET_POS              GET_POS,<mod>
+  //   SET_LIMITS <min>,<max>        (legacy, Module 1)
+  //   SET_LIMITS <mod>,<min>,<max>  (per-module)
 
   else if (command == "RESET_POS") {
-    modules[0].stepPosition = 0;
-    Serial.println("POS_RESET 0");
+    int idx = parseModuleIdx(args);
+    modules[idx].stepPosition = 0;
+    Serial.print("POS_RESET M");
+    Serial.println(idx + 1);
   }
 
   else if (command == "SET_MIN") {
-    modules[0].minStepLimit = modules[0].stepPosition;
-    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
-    Serial.print("MIN_SET ");
-    Serial.println(modules[0].minStepLimit);
+    int idx = parseModuleIdx(args);
+    modules[idx].minStepLimit = modules[idx].stepPosition;
+    modules[idx].limitsActive = (modules[idx].minStepLimit != -999999L || modules[idx].maxStepLimit != 999999L);
+    Serial.print("MIN_SET M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].minStepLimit);
   }
 
   else if (command == "SET_MAX") {
-    modules[0].maxStepLimit = modules[0].stepPosition;
-    modules[0].limitsActive = (modules[0].minStepLimit != -999999L || modules[0].maxStepLimit != 999999L);
-    Serial.print("MAX_SET ");
-    Serial.println(modules[0].maxStepLimit);
+    int idx = parseModuleIdx(args);
+    modules[idx].maxStepLimit = modules[idx].stepPosition;
+    modules[idx].limitsActive = (modules[idx].minStepLimit != -999999L || modules[idx].maxStepLimit != 999999L);
+    Serial.print("MAX_SET M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].maxStepLimit);
   }
 
   else if (command == "SET_LIMITS") {
-    int commaPos = args.indexOf(',');
-    if (commaPos != -1) {
-      modules[0].minStepLimit = args.substring(0, commaPos).toInt();
-      modules[0].maxStepLimit = args.substring(commaPos + 1).toInt();
-      modules[0].limitsActive = true;
-      Serial.print("LIMITS_SET ");
-      Serial.print(modules[0].minStepLimit);
+    int firstComma  = args.indexOf(',');
+    int secondComma = (firstComma != -1) ? args.indexOf(',', firstComma + 1) : -1;
+    if (firstComma != -1) {
+      int idx;
+      long minVal;
+      long maxVal;
+      if (secondComma != -1) {
+        // New 3-arg form: <mod>,<min>,<max>
+        int id = args.substring(0, firstComma).toInt();
+        if (id < 1 || id > moduleCount) {
+          Serial.print("SET_LIMITS_BAD_MOD ");
+          Serial.println(id);
+          return;
+        }
+        idx    = id - 1;
+        minVal = args.substring(firstComma + 1, secondComma).toInt();
+        maxVal = args.substring(secondComma + 1).toInt();
+      } else {
+        // Legacy 2-arg form: <min>,<max> targets Module 1
+        idx    = 0;
+        minVal = args.substring(0, firstComma).toInt();
+        maxVal = args.substring(firstComma + 1).toInt();
+      }
+      modules[idx].minStepLimit = minVal;
+      modules[idx].maxStepLimit = maxVal;
+      modules[idx].limitsActive = true;
+      Serial.print("LIMITS_SET M");
+      Serial.print(idx + 1);
+      Serial.print(" ");
+      Serial.print(modules[idx].minStepLimit);
       Serial.print(",");
-      Serial.println(modules[0].maxStepLimit);
+      Serial.println(modules[idx].maxStepLimit);
     }
   }
 
   else if (command == "CLEAR_LIMITS") {
-    modules[0].limitsActive = false;
-    modules[0].minStepLimit = -999999L;
-    modules[0].maxStepLimit = 999999L;
-    Serial.println("LIMITS_CLEARED");
+    int idx = parseModuleIdx(args);
+    modules[idx].limitsActive = false;
+    modules[idx].minStepLimit = -999999L;
+    modules[idx].maxStepLimit = 999999L;
+    Serial.print("LIMITS_CLEARED M");
+    Serial.println(idx + 1);
   }
 
   else if (command == "GET_POS") {
-    Serial.print("POS ");
-    Serial.println(modules[0].stepPosition);
+    int idx = parseModuleIdx(args);
+    Serial.print("POS M");
+    Serial.print(idx + 1);
+    Serial.print(" ");
+    Serial.println(modules[idx].stepPosition);
   }
 
   else {
@@ -866,6 +962,17 @@ void loop() {
       if (i == 0) currentPressure = hpa;
     }
 
+    // Stream step position for every wired module, independent of pressure
+    // sensor presence. Modules without a pressure sensor still need their
+    // stepper position visible on the GUI so calibration can work.
+    for (int i = 0; i < moduleCount; i++) {
+      if (!modules[i].active) continue;
+      Serial.print("POS,");
+      Serial.print(i + 1);
+      Serial.print(",");
+      Serial.println(modules[i].stepPosition);
+    }
+
     // Read and stream IMU data
     if (imuPresent) {
       tcaselect(IMU_CHANNEL);
@@ -904,6 +1011,19 @@ void loop() {
     for (int i = 0; i < moduleCount; i++) {
       if (!pidEnabledM[i]) continue;
       if (!modules[i].active) continue;
+      // Defensive: refuse to auto-step a module whose stepper limits have not
+      // been calibrated. Experiments mode drives the rig via pressure (SET),
+      // which enables PID here — without this guard, an uncalibrated module
+      // could be driven past its physical wall. Burst/one-shot commands (e.g.
+      // INFLATE/DEFLATE) bypass this loop and still work during calibration.
+      if (!modules[i].limitsActive) {
+        if (!pidLimitWarned[i]) {
+          Serial.print("PID_BLOCKED_NO_LIMITS M");
+          Serial.println(i + 1);
+          pidLimitWarned[i] = true;
+        }
+        continue;
+      }
       if (modules[i].stepsRemaining > 0) continue;  // mid-burst, wait
 
       float err = setpointHpaM[i] - currentPressureM[i];
