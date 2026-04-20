@@ -118,14 +118,10 @@ class CalibrationPanel(tk.Frame):
         tk.Label(row, text="Adjust:", font=FONT_BODY,
                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=5)
 
-        # Inflate/Deflate target the currently-selected module. The visual
-        # "Inflate" vs "Deflate" labels are swapped intentionally against the
-        # underlying serial command so the UI matches the physical rig: on
-        # this rig, deflating physically extends, so "Inflate" -> DEFLATE.
         AccentButton(row, text="Inflate",
-                    command=lambda: self._send_module("DEFLATE")).pack(side="left", padx=3)
-        AccentButton(row, text="Deflate",
                     command=lambda: self._send_module("INFLATE")).pack(side="left", padx=3)
+        AccentButton(row, text="Deflate",
+                    command=lambda: self._send_module("DEFLATE")).pack(side="left", padx=3)
 
         AccentButton(row, text=f"Set {title.split(':')[1].strip()}",
                     accent=ACCENT_ORANGE, font=FONT_BUTTON_LARGE,

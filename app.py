@@ -643,6 +643,7 @@ class ArmUI:
         self.send(f"SET_MIN,{module_id}")
         self.cal_panel.cal_back_var.set(f"Back wall: {pos} steps")
         self._cal_check_ready(module_id)
+        self._persist_calibration()
 
     def cal_set_front(self, module_id):
         pos = self._module_step_position(module_id)
@@ -651,6 +652,7 @@ class ArmUI:
         self.send(f"SET_MAX,{module_id}")
         self.cal_panel.cal_front_var.set(f"Front wall: {pos} steps")
         self._cal_check_ready(module_id)
+        self._persist_calibration()
 
     def _cal_check_ready(self, module_id):
         lim = self.cal_limits.get(module_id) or {}
@@ -664,8 +666,8 @@ class ArmUI:
                 self.cal_panel.cal_range_var.set("Error: back must be < front")
                 self.cal_panel.enable_save(False)
 
-    def cal_save(self):
-        # Only save modules whose back+front are both set and valid.
+    def _persist_calibration(self):
+        """Write current cal_limits to disk. Only valid (back<front) modules are saved."""
         payload = {}
         for mid, lim in self.cal_limits.items():
             back = lim.get("back")
@@ -673,35 +675,29 @@ class ArmUI:
             if back is None or front is None or back >= front:
                 continue
             payload[str(mid)] = {"back": back, "front": front}
-        if not payload:
-            return
-        cal_data = {"modules": payload}
         try:
             with open(self.cal_file, "w") as f:
-                json.dump(cal_data, f, indent=2)
-            self.calibration_loaded = True
-            summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]" for mid, v in payload.items())
-            self.status.set(f"CALIBRATION SAVED: {summary}")
+                json.dump({"modules": payload}, f, indent=2)
+            self.calibration_loaded = bool(payload)
+            return payload
         except Exception as e:
-            self.status.set(f"Error saving calibration: {e}")
+            print(f"[WARN] Could not write calibration: {e}")
+            return None
+
+    def cal_save(self):
+        payload = self._persist_calibration()
+        if not payload:
+            self.status.set("Nothing to save: set back and front walls first")
+            return
+        summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]" for mid, v in payload.items())
+        self.status.set(f"CALIBRATION SAVED: {summary}")
 
     def cal_clear(self, module_id):
         """Clear limits for a single module (the one currently selected in the panel)."""
         self.send(f"CLEAR_LIMITS,{module_id}")
         self.cal_limits.pop(module_id, None)
         self.cal_panel.clear_display(module_id)
-        # Rewrite the on-disk file so this module is removed from persistence.
-        try:
-            if self.cal_limits:
-                payload = {str(mid): dict(v) for mid, v in self.cal_limits.items()
-                           if v.get("back") is not None and v.get("front") is not None}
-                with open(self.cal_file, "w") as f:
-                    json.dump({"modules": payload}, f, indent=2)
-            elif os.path.exists(self.cal_file):
-                os.remove(self.cal_file)
-        except Exception as e:
-            print(f"[WARN] Could not update calibration file: {e}")
-        self.calibration_loaded = bool(self.cal_limits)
+        self._persist_calibration()
         self.status.set(f"LIMITS CLEARED M{module_id}")
 
     def _load_calibration_from_disk(self):
