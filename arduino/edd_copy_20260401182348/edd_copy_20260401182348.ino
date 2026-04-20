@@ -31,6 +31,19 @@ int bendValue = 0;    // XY -100..100
 int bendValueXZ = 0;  // XZ -100..100
 int bendValueAll = 0; // All servos -100..100
 
+// Running center per servo. Shifts on CENTER (v=0) to latch the last commanded
+// angle, so subsequent slider moves are incremental from the held position
+// rather than snapping back to BEND_CENTER_DEG.
+int centerAngleA = BEND_CENTER_DEG;
+int centerAngleB = BEND_CENTER_DEG;
+int centerAngleC = BEND_CENTER_DEG;
+int centerAngleD = BEND_CENTER_DEG;
+// Last angle each servo was commanded to (source for the center latch).
+int lastAngleA = BEND_CENTER_DEG;
+int lastAngleB = BEND_CENTER_DEG;
+int lastAngleC = BEND_CENTER_DEG;
+int lastAngleD = BEND_CENTER_DEG;
+
 // =========================
 // I2C Multiplexer (PCA9548A)
 // =========================
@@ -568,22 +581,30 @@ void handleCommand(String cmd) {
     // Slider left (v<0) -> drive A, detach B. Slider right (v>0) -> drive B, detach A.
     int mag = v < 0 ? -v : v;
     int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleA = BEND_CENTER_DEG;
-    int angleB = BEND_CENTER_DEG;
+    int angleA = centerAngleA;
+    int angleB = centerAngleB;
 
     if (v < 0) {
       if (bendServoB.attached()) bendServoB.detach();
       if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
-      angleA = BEND_CENTER_DEG + offset;
+      angleA = constrain(centerAngleA + offset, 0, 180);
       bendServoA.write(angleA);
+      lastAngleA = angleA;
     } else if (v > 0) {
       if (bendServoA.attached()) bendServoA.detach();
       if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
-      angleB = BEND_CENTER_DEG + offset;
+      angleB = constrain(centerAngleB + offset, 0, 180);
       bendServoB.write(angleB);
+      lastAngleB = angleB;
     } else {
-      if (bendServoA.attached()) bendServoA.detach();
-      if (bendServoB.attached()) bendServoB.detach();
+      // Latch last commanded angles as new centers. Keep the active servo
+      // attached and holding; do not detach on center.
+      centerAngleA = lastAngleA;
+      centerAngleB = lastAngleB;
+      if (bendServoA.attached()) bendServoA.write(lastAngleA);
+      if (bendServoB.attached()) bendServoB.write(lastAngleB);
+      angleA = lastAngleA;
+      angleB = lastAngleB;
     }
 
     Serial.print("BEND ");
@@ -607,22 +628,30 @@ void handleCommand(String cmd) {
 
     int mag = v < 0 ? -v : v;
     int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleC = BEND_CENTER_DEG;
-    int angleD = BEND_CENTER_DEG;
+    int angleC = centerAngleC;
+    int angleD = centerAngleD;
 
     if (v < 0) {
       if (bendServoD.attached()) bendServoD.detach();
       if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
-      angleC = BEND_CENTER_DEG + offset;
+      angleC = constrain(centerAngleC + offset, 0, 180);
       bendServoC.write(angleC);
+      lastAngleC = angleC;
     } else if (v > 0) {
       if (bendServoC.attached()) bendServoC.detach();
       if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
-      angleD = BEND_CENTER_DEG + offset;
+      angleD = constrain(centerAngleD + offset, 0, 180);
       bendServoD.write(angleD);
+      lastAngleD = angleD;
     } else {
-      if (bendServoC.attached()) bendServoC.detach();
-      if (bendServoD.attached()) bendServoD.detach();
+      // Latch last commanded angles as new centers. Keep the active servo
+      // attached and holding; do not detach on center.
+      centerAngleC = lastAngleC;
+      centerAngleD = lastAngleD;
+      if (bendServoC.attached()) bendServoC.write(lastAngleC);
+      if (bendServoD.attached()) bendServoD.write(lastAngleD);
+      angleC = lastAngleC;
+      angleD = lastAngleD;
     }
 
     Serial.print("BEND_XZ ");
@@ -646,24 +675,37 @@ void handleCommand(String cmd) {
 
     int allAngle = BEND_CENTER_DEG;
     if (v == 0) {
-      if (bendServoA.attached()) bendServoA.detach();
-      if (bendServoB.attached()) bendServoB.detach();
-      if (bendServoC.attached()) bendServoC.detach();
-      if (bendServoD.attached()) bendServoD.detach();
+      // Latch each servo's last commanded angle as its new center. Keep
+      // whichever servos are attached holding their positions.
+      centerAngleA = lastAngleA;
+      centerAngleB = lastAngleB;
+      centerAngleC = lastAngleC;
+      centerAngleD = lastAngleD;
+      if (bendServoA.attached()) bendServoA.write(lastAngleA);
+      if (bendServoB.attached()) bendServoB.write(lastAngleB);
+      if (bendServoC.attached()) bendServoC.write(lastAngleC);
+      if (bendServoD.attached()) bendServoD.write(lastAngleD);
+      allAngle = lastAngleA;
     } else {
       int mag = v < 0 ? -v : v;
       int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-      allAngle = (v > 0) ? (BEND_CENTER_DEG + offset) : (BEND_CENTER_DEG - offset);
+      int signedOffset = (v > 0) ? offset : -offset;
 
       if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
       if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
       if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
       if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
 
-      bendServoA.write(allAngle);
-      bendServoB.write(allAngle);
-      bendServoC.write(allAngle);
-      bendServoD.write(allAngle);
+      int aA = constrain(centerAngleA + signedOffset, 0, 180);
+      int aB = constrain(centerAngleB + signedOffset, 0, 180);
+      int aC = constrain(centerAngleC + signedOffset, 0, 180);
+      int aD = constrain(centerAngleD + signedOffset, 0, 180);
+
+      bendServoA.write(aA); lastAngleA = aA;
+      bendServoB.write(aB); lastAngleB = aB;
+      bendServoC.write(aC); lastAngleC = aC;
+      bendServoD.write(aD); lastAngleD = aD;
+      allAngle = aA;
     }
 
     Serial.print("BEND_ALL ");
