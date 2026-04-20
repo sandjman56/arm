@@ -1,6 +1,6 @@
 # app.py -- Main ArmUI orchestrator
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import threading
 import queue
 import os
@@ -458,22 +458,18 @@ class ArmUI:
 
         mode = self.mode.get()
         if mode == "burst":
+            self._push_saved_limits()
             self.burst_panel.pack(fill="both", expand=True)
         elif mode == "pid":
             self.pid_panel.pack(fill="both", expand=True)
         elif mode == "calibration":
-            # Reset each wired module's stepper position and either push its
-            # saved limits to firmware or clear any stale limits for modules
-            # that have not been calibrated yet.
+            # Reset each wired module's stepper position and push saved
+            # limits (or clear stale limits for uncalibrated modules).
             for mod in self._wired_modules():
                 mid = mod["id"]
                 self.send(f"RESET_POS,{mid}")
                 mod["step_position"].set(0)
-                lim = self.cal_limits.get(mid)
-                if lim is not None:
-                    self.send(f"SET_LIMITS {mid},{lim['back']},{lim['front']}")
-                else:
-                    self.send(f"CLEAR_LIMITS,{mid}")
+            self._push_saved_limits()
             self.step_position = 0
             # Refresh the panel for whichever module the user has selected.
             self._cal_on_module_change(self.cal_panel.selected_module_id.get())
@@ -692,9 +688,20 @@ class ArmUI:
         payload = self._persist_calibration()
         if not payload:
             self.status.set("Nothing to save: set back and front walls first")
+            messagebox.showwarning(
+                "Calibration",
+                "Set both back and front walls for at least one module before saving.",
+            )
             return
+        # Defense-in-depth: push saved limits to firmware so that burst and
+        # calibration bursts hit the clamp even if the firmware was reset.
+        self._push_saved_limits()
         summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]" for mid, v in payload.items())
         self.status.set(f"CALIBRATION SAVED: {summary}")
+        messagebox.showinfo(
+            "Calibration Saved",
+            f"Saved to {os.path.basename(self.cal_file)}.\n\n{summary}\n\nLimits are now active on the controller and will reload automatically next session.",
+        )
 
     def cal_clear(self, module_id):
         """Clear limits for a single module (the one currently selected in the panel)."""
@@ -737,14 +744,26 @@ class ArmUI:
                                 for mid, v in sorted(self.cal_limits.items()))
             print(f"[INFO] Calibration loaded from disk: {summary}")
 
+    def _push_saved_limits(self):
+        """For every wired module, push saved limits (or CLEAR if none).
+        Safe to call repeatedly — idempotent on the firmware side."""
+        if not self.arduino.ser or not self.arduino.ser.is_open:
+            return
+        for mod in self._wired_modules():
+            mid = mod["id"]
+            lim = self.cal_limits.get(mid)
+            if lim is not None:
+                self.send(f"SET_LIMITS {mid},{lim['back']},{lim['front']}")
+            else:
+                self.send(f"CLEAR_LIMITS,{mid}")
+
     def load_calibration(self):
         """Push all saved per-module limits to firmware after a fresh connect."""
         if not self.cal_limits and os.path.exists(self.cal_file):
             self._load_calibration_from_disk()
         if not self.cal_limits:
             return
-        for mid, lim in self.cal_limits.items():
-            self.send(f"SET_LIMITS {mid},{lim['back']},{lim['front']}")
+        self._push_saved_limits()
         summary = ", ".join(f"M{mid}:[{v['back']},{v['front']}]"
                             for mid, v in sorted(self.cal_limits.items()))
         self.status.set(f"CALIBRATION LOADED: {summary}")
