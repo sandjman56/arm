@@ -247,6 +247,9 @@ float setpointHpaM[MAX_MODULES]     = {0};
 bool  pidEnabledM[MAX_MODULES]      = {false};
 float integralM[MAX_MODULES]        = {0};
 float lastErrorM[MAX_MODULES]       = {0};
+// Set true once PID has emitted a "blocked, no limits calibrated" warning for
+// this module, so the warning fires at most once per pid-enable cycle.
+bool  pidLimitWarned[MAX_MODULES]   = {false};
 
 // Legacy shared PID state (module 0 mirror); kept for diagnostics only.
 float integral = 0;
@@ -317,9 +320,11 @@ void setup() {
   digitalWrite(EN_PIN, LOW);  // ENABLE DRIVER
 
   // Default Module 1: STEP=3, DIR=4 (matches original wiring)
+  // Module 3: STEP=30, DIR=28
   initModule(0, 3, 4);
   initModule(1, 8, 7);
-  moduleCount = 2;
+  initModule(2, 30, 28);
+  moduleCount = 3;
 
   // Bend servos start detached (no power) — attached on demand by BEND command
   pinMode(BEND_SERVO_A_PIN, OUTPUT);
@@ -517,6 +522,7 @@ void handleCommand(String cmd) {
     pidEnabledM[modIdx]  = true;
     integralM[modIdx]    = 0;
     lastErrorM[modIdx]   = 0;
+    pidLimitWarned[modIdx] = false;
     pidEnabled = true;  // master flag
 
     // Keep legacy single-module globals in sync when module 0 is targeted.
@@ -946,6 +952,19 @@ void loop() {
     for (int i = 0; i < moduleCount; i++) {
       if (!pidEnabledM[i]) continue;
       if (!modules[i].active) continue;
+      // Defensive: refuse to auto-step a module whose stepper limits have not
+      // been calibrated. Experiments mode drives the rig via pressure (SET),
+      // which enables PID here — without this guard, an uncalibrated module
+      // could be driven past its physical wall. Burst/one-shot commands (e.g.
+      // INFLATE/DEFLATE) bypass this loop and still work during calibration.
+      if (!modules[i].limitsActive) {
+        if (!pidLimitWarned[i]) {
+          Serial.print("PID_BLOCKED_NO_LIMITS M");
+          Serial.println(i + 1);
+          pidLimitWarned[i] = true;
+        }
+        continue;
+      }
       if (modules[i].stepsRemaining > 0) continue;  // mid-burst, wait
 
       float err = setpointHpaM[i] - currentPressureM[i];
