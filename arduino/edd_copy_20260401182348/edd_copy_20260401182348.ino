@@ -17,7 +17,7 @@ struct MPUData {
 #define BEND_SERVO_A_PIN 9   // XY left
 #define BEND_SERVO_B_PIN 10  // XY right
 #define BEND_SERVO_C_PIN 11  // XZ left
-#define BEND_SERVO_D_PIN 12  // XZ right
+#define BEND_SERVO_D_PIN 24  // XZ right
 
 // Neutral angle and max deflection (degrees)
 #define BEND_CENTER_DEG 90
