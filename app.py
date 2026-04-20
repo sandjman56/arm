@@ -667,7 +667,8 @@ class ArmUI:
                 self.cal_panel.enable_save(False)
 
     def _persist_calibration(self):
-        """Write current cal_limits to disk. Only valid (back<front) modules are saved."""
+        """Write current cal_limits to disk. Only valid (back<front) modules are saved.
+        If no modules remain, delete the file so nothing is restored on restart."""
         payload = {}
         for mid, lim in self.cal_limits.items():
             back = lim.get("back")
@@ -676,8 +677,11 @@ class ArmUI:
                 continue
             payload[str(mid)] = {"back": back, "front": front}
         try:
-            with open(self.cal_file, "w") as f:
-                json.dump({"modules": payload}, f, indent=2)
+            if payload:
+                with open(self.cal_file, "w") as f:
+                    json.dump({"modules": payload}, f, indent=2)
+            elif os.path.exists(self.cal_file):
+                os.remove(self.cal_file)
             self.calibration_loaded = bool(payload)
             return payload
         except Exception as e:
@@ -698,7 +702,8 @@ class ArmUI:
         self.cal_limits.pop(module_id, None)
         self.cal_panel.clear_display(module_id)
         self._persist_calibration()
-        self.status.set(f"LIMITS CLEARED M{module_id}")
+        remaining = ", ".join(f"M{mid}" for mid in sorted(self.cal_limits)) or "none"
+        self.status.set(f"LIMITS CLEARED M{module_id} (remaining: {remaining})")
 
     def _load_calibration_from_disk(self):
         if not os.path.exists(self.cal_file):
