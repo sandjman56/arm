@@ -24,6 +24,7 @@ class TrunkPreview3D(tk.Frame):
         self._tip: Tuple[float, float, float] = (0.0, 0.0, 240.0)
         self._arc_points = [(0.0, 0.0, z) for z in range(0, 241, 12)]
         self._target: Optional[Tuple[float, float, float]] = None
+        self._reached = False
         self._redraw()
 
     def set_tip_and_arc(self, tip: Tuple[float, float, float],
@@ -34,6 +35,12 @@ class TrunkPreview3D(tk.Frame):
 
     def set_target(self, target: Optional[Tuple[float, float, float]]) -> None:
         self._target = target
+        self._redraw()
+
+    def set_reached(self, reached: bool) -> None:
+        if self._reached == reached:
+            return
+        self._reached = reached
         self._redraw()
 
     def _redraw(self) -> None:
@@ -57,8 +64,9 @@ class TrunkPreview3D(tk.Frame):
             ax.plot(xs, ys, zs, color="#0aa", linewidth=2)
         # Tip marker.
         ax.scatter([self._tip[0]], [self._tip[1]], [self._tip[2]], color="#0aa", s=40)
-        # Target marker (red dot to match the 2D pickers).
+        # Target marker (red normally, green once reached — matches 2D pickers).
         if self._target is not None:
+            tcolor = "#00d060" if self._reached else "red"
             ax.scatter([self._target[0]], [self._target[1]], [self._target[2]],
-                       color="red", s=70, marker="o", edgecolors="red")
+                       color=tcolor, s=70, marker="o", edgecolors=tcolor)
         self._canvas.draw_idle()

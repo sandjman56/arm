@@ -93,6 +93,7 @@ class XYPicker(_BasePicker):
         self._r_max = r_max
         self._tip_xy: Tuple[float, float] = (0.0, 0.0)
         self._target_xy: Optional[Tuple[float, float]] = None
+        self._reached = False
         self._redraw()
 
     def set_r_max(self, r_max: float) -> None:
@@ -105,6 +106,12 @@ class XYPicker(_BasePicker):
 
     def set_target(self, x: Optional[float], y: Optional[float]) -> None:
         self._target_xy = (x, y) if x is not None and y is not None else None
+        self._redraw()
+
+    def set_reached(self, reached: bool) -> None:
+        if self._reached == reached:
+            return
+        self._reached = reached
         self._redraw()
 
     def _is_inside(self, x: float, y: float) -> bool:
@@ -126,11 +133,12 @@ class XYPicker(_BasePicker):
         ax.axvline(0, color="#444", linewidth=0.5)
         # Tip marker (teal).
         ax.plot([self._tip_xy[0]], [self._tip_xy[1]], marker="o", color="#0aa", markersize=7)
-        # Target marker (red filled circle).
+        # Target marker (red normally, green once reached).
         if self._target_xy is not None:
+            tcolor = "#00d060" if self._reached else "red"
             ax.plot([self._target_xy[0]], [self._target_xy[1]],
-                    marker="o", color="red", markersize=9, markeredgecolor="red",
-                    markerfacecolor="red")
+                    marker="o", color=tcolor, markersize=9, markeredgecolor=tcolor,
+                    markerfacecolor=tcolor)
         ax.set_xlabel("X (mm)")
         ax.set_ylabel("Y (mm)")
         self._canvas.draw_idle()
@@ -166,6 +174,13 @@ class XZPicker(_BasePicker):
         self._locked_x: Optional[float] = None
         # Current Z of the draggable dot (None if no lock yet).
         self._dot_z: Optional[float] = None
+        self._reached = False
+        self._redraw()
+
+    def set_reached(self, reached: bool) -> None:
+        if self._reached == reached:
+            return
+        self._reached = reached
         self._redraw()
 
     def set_workspace(self, L_rest: float, L_max: float, theta_max_rad: float) -> None:
@@ -268,13 +283,14 @@ class XZPicker(_BasePicker):
         ax.axvline(0, color="#444", linewidth=0.5)
         # Current tip (teal).
         ax.plot([self._tip_xz[0]], [self._tip_xz[1]], marker="o", color="#0aa", markersize=7)
-        # Red guide line + draggable red dot (only after XY is picked).
+        # Guide line + draggable target dot (red normally, green once reached).
         if self._locked_x is not None:
-            ax.axvline(self._locked_x, color="red", linewidth=1.2, linestyle="--")
+            tcolor = "#00d060" if self._reached else "red"
+            ax.axvline(self._locked_x, color=tcolor, linewidth=1.2, linestyle="--")
             if self._dot_z is not None:
                 ax.plot([self._locked_x], [self._dot_z],
-                        marker="o", color="red", markersize=10,
-                        markeredgecolor="red", markerfacecolor="red")
+                        marker="o", color=tcolor, markersize=10,
+                        markeredgecolor=tcolor, markerfacecolor=tcolor)
         ax.set_xlabel("X (mm)")
         ax.set_ylabel("Z (mm)")
         self._canvas.draw_idle()

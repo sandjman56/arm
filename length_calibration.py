@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 DEFAULT_WORKSPACE = {
     "L_rest_mm": 88.9,
-    "L_max_mm": 88.9,
+    "L_max_mm": 130.0,   # safety ceiling — prevents over-extension
     "theta_max_rad": 1.0472,  # 60 degrees
 }
 

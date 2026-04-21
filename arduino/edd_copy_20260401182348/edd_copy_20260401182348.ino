@@ -189,7 +189,7 @@ Adafruit_MPRLS mpr = Adafruit_MPRLS();
 
 // Pressure sensor channel mapping (via PCA9548A mux)
 #define NUM_PRESSURE_SENSORS 5
-uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3, 4, 5};
+uint8_t pressureChannels[MAX_MODULES] = {3, 0, 1, 4, 5};
 // index 0 -> Module 1 on ch 1 (SD1/SC1)
 // index 1 -> Module 2 on ch 0 (SD0/SC0)
 // index 2 -> Module 3 on ch 3 (SD3/SC3)
@@ -220,6 +220,10 @@ int moduleCount = 0;
 // Motion tuning
 // =========================
 const int BURST_STEPS = 40;
+// Pressure deadband (hPa). PID skips stepping when |err| is under this, so the
+// stepper doesn't hunt/overshoot on the ~0.1 psi pneumatic noise floor. 5 hPa
+// ≈ 0.07 psi.
+const float PID_DEADBAND_HPA = 5.0;
 const int STEP_DELAY_US = 2000;
 
 // =========================
@@ -245,9 +249,6 @@ float setpointHpaM[MAX_MODULES]     = {0};
 bool  pidEnabledM[MAX_MODULES]      = {false};
 float integralM[MAX_MODULES]        = {0};
 float lastErrorM[MAX_MODULES]       = {0};
-// Set true once PID has emitted a "blocked, no limits calibrated" warning for
-// this module, so the warning fires at most once per pid-enable cycle.
-bool  pidLimitWarned[MAX_MODULES]   = {false};
 
 // Legacy shared PID state (module 0 mirror); kept for diagnostics only.
 float integral = 0;
@@ -532,7 +533,6 @@ void handleCommand(String cmd) {
     pidEnabledM[modIdx]  = true;
     integralM[modIdx]    = 0;
     lastErrorM[modIdx]   = 0;
-    pidLimitWarned[modIdx] = false;
     pidEnabled = true;  // master flag
 
     // Keep legacy single-module globals in sync when module 0 is targeted.
@@ -937,22 +937,16 @@ void loop() {
     for (int i = 0; i < moduleCount; i++) {
       if (!pidEnabledM[i]) continue;
       if (!modules[i].active) continue;
-      // Defensive: refuse to auto-step a module whose stepper limits have not
-      // been calibrated. Experiments mode drives the rig via pressure (SET),
-      // which enables PID here — without this guard, an uncalibrated module
-      // could be driven past its physical wall. Burst/one-shot commands (e.g.
-      // INFLATE/DEFLATE) bypass this loop and still work during calibration.
-      if (!modules[i].limitsActive) {
-        if (!pidLimitWarned[i]) {
-          Serial.print("PID_BLOCKED_NO_LIMITS M");
-          Serial.println(i + 1);
-          pidLimitWarned[i] = true;
-        }
-        continue;
-      }
       if (modules[i].stepsRemaining > 0) continue;  // mid-burst, wait
 
       float err = setpointHpaM[i] - currentPressureM[i];
+
+      // Deadband: within tolerance of setpoint, hold position and freeze the
+      // integrator so it doesn't wind up on sensor noise.
+      if (fabs(err) < PID_DEADBAND_HPA) {
+        lastErrorM[i] = err;
+        continue;
+      }
 
       integralM[i] += err * 0.025;
       float derivative = (err - lastErrorM[i]) / 0.025;

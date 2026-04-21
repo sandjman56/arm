@@ -531,6 +531,17 @@ class ArmUI:
         # (base-relative). Display frame origin = (0, 0, L_rest).
         tx, ty, tz = target_display
         target_physics = (tx, ty, tz + self.length_cal.L_rest)
+        # Operator-supplied per-module pressure ceiling (absolute psi). The
+        # controller clamps every SET command to this value.
+        from tkinter import simpledialog
+        ceiling = simpledialog.askfloat(
+            "Reach — Pressure Ceiling",
+            "Max per-module pressure (psi absolute):",
+            parent=self.root, minvalue=14.0, maxvalue=25.0, initialvalue=18.0,
+        )
+        if ceiling is None:
+            self.experiment_panel.set_status("Reach cancelled (no ceiling)")
+            return
         # Latch the servo defaults from the burst panel's current slider state
         # so the bend controller composes its offsets on top of known angles,
         # never a stale/random read.
@@ -542,8 +553,14 @@ class ArmUI:
         except (AttributeError, IndexError):
             servo_defaults = None
         try:
-            self.experiment_controller.reach(target_physics, servo_defaults=servo_defaults)
-            self.experiment_panel.set_status(f"Reaching toward {target_display}")
+            self.experiment_controller.reach(
+                target_physics,
+                servo_defaults=servo_defaults,
+                pressure_ceiling_psi=ceiling,
+            )
+            self.experiment_panel.set_status(
+                f"Reaching toward {target_display} (≤{ceiling:.1f} psi)"
+            )
             self.experiment_panel.set_target_marker(target_physics)
         except ValueError as e:
             self.experiment_panel.set_status(f"Rejected: {e}")
@@ -912,6 +929,28 @@ class ArmUI:
             # frame (preview rendering). Panel handles the frame split.
             arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
             self.experiment_panel.set_tip_position(tip_zero, arc_pts_base)
+            # Emit one log row per tick while logging is active.
+            if self.logger.is_active:
+                pressures = s.module_pressures_psi
+                angles = self.experiment_controller.last_tendon_angles
+                def _imu(k):
+                    v = self.imu_data[k].get()
+                    try:
+                        return float(v)
+                    except ValueError:
+                        return ""
+                self.logger.log([
+                    pressures.get(1, ""), pressures.get(2, ""),
+                    pressures.get(3, ""), pressures.get(4, ""), pressures.get(5, ""),
+                    _imu("ax"), _imu("ay"), _imu("az"),
+                    _imu("gx"), _imu("gy"), _imu("gz"),
+                    angles.get(1, ""), angles.get(2, ""),
+                    angles.get(3, ""), angles.get(4, ""),
+                    f"{_m.degrees(s.pitch):.3f}",
+                    f"{_m.degrees(s.roll):.3f}",
+                    f"{_m.degrees(s.yaw):.3f}",
+                    self.experiment_controller.state.value,
+                ])
         except Exception as e:
             # Keep the main loop alive even if the experiment panel breaks.
             print(f"[WARN] experiment tick failed: {e}")

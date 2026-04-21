@@ -29,10 +29,12 @@ class RunResult:
 
 
 class ExperimentController:
-    ELONGATION_TIMEOUT_S = 10.0
-    BEND_TIMEOUT_S = 15.0
+    ELONGATION_TIMEOUT_S = 45.0
+    MIN_ELONGATION_S = 2.0          # don't transition to BENDING sooner than this
+    BEND_TIMEOUT_S = 30.0
     TOL_ANGLE_RAD = math.radians(3)
     TOL_POS_MM = 10.0
+    TOL_PRESSURE_PSI = 0.3  # per-module setpoint convergence
     KP_BEND = 4.0                 # legacy rate gain (unused when servo_defaults is set)
     KP_BEND_ANGLE_DEG_PER_RAD = 30.0
     BEND_ANGLE_MAX_DEG = 45.0
@@ -53,6 +55,11 @@ class ExperimentController:
         # while both are populated.
         self._psi_baseline: Optional[Dict[int, float]] = None
         self._servo_defaults: Optional[Dict[int, float]] = None
+        self._pressure_ceiling_psi: Optional[float] = None
+        # Last commanded per-module pressure setpoints (for convergence check).
+        self._pressure_setpoints: Dict[int, float] = {}
+        # Last commanded tendon-servo angles (for logging).
+        self.last_tendon_angles: Dict[int, float] = {}
 
     # --- Transitions -------------------------------------------------------
 
@@ -89,6 +96,7 @@ class ExperimentController:
         self,
         target: Tuple[float, float, float],
         servo_defaults: Optional[Dict[int, float]] = None,
+        pressure_ceiling_psi: Optional[float] = None,
     ) -> None:
         """Begin a reach attempt to `target` in the physics frame.
 
@@ -98,8 +106,11 @@ class ExperimentController:
         composes on top (common-mode slack + differential-mode bend). When
         omitted, the legacy rate-based path is used (tests, simulation).
         """
-        if self.state != State.WAITING_FOR_TARGET and self.state != State.REACHED:
-            return
+        if self.state not in (State.WAITING_FOR_TARGET, State.REACHED, State.TIMED_OUT):
+            raise ValueError(
+                f"not ready to Reach (state={self.state.value}). "
+                "Press Zero @ Rest → Confirm Zero first."
+            )
         if servo_defaults is not None and self._psi_baseline is None:
             raise ValueError(
                 "pressure baseline not captured — press Confirm Zero before Reach"
@@ -117,16 +128,15 @@ class ExperimentController:
         self._phase_start = time.monotonic()
         # Latch servo defaults (by value). None disables the angle-control path.
         self._servo_defaults = dict(servo_defaults) if servo_defaults is not None else None
-        # In sim mode, poke the backend with the target orientation so its
-        # slewing engine converges during BENDING.
+        self._pressure_ceiling_psi = pressure_ceiling_psi
+        # Command module pressures for the requested arc length, clamped to
+        # the operator-supplied safety ceiling.
+        self._command_module_pressures_for_length(L_target)
+        # In sim mode, poke the backend with the total length directly so its
+        # slewing engine has a target.
         if hasattr(self.backend, "set_total_length_target"):
             self.backend.set_total_length_target(L_target)
-        if hasattr(self.backend, "set_orientation_target"):
-            target_pitch = theta_target * math.cos(phi_target)
-            target_roll = theta_target * math.sin(phi_target)
-            self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
-        # No pressure-driven elongation: L_rest == L_max. Go straight to bending.
-        self.state = State.BENDING
+        self.state = State.ELONGATING
 
     # --- Main tick ---------------------------------------------------------
 
@@ -150,15 +160,18 @@ class ExperimentController:
     def _tick_elongating(self) -> None:
         s = self.backend.read_state()
         elapsed = time.monotonic() - self._phase_start
-        # Convergence: SimBackend length near target, or pressures near setpoints.
-        if abs(s.total_length_mm - self._L_target) < 5.0:
-            # Move on to bending phase.
+        # Hold in ELONGATING for at least MIN_ELONGATION_S so inflation and
+        # tendon slack pay-out are visible and physically complete.
+        if elapsed < self.MIN_ELONGATION_S:
+            return
+        length_converged = abs(s.total_length_mm - self._L_target) < 5.0
+        pressure_converged = bool(self._pressure_setpoints) and all(
+            abs(s.module_pressures_psi.get(mid, 0.0) - sp) < self.TOL_PRESSURE_PSI
+            for mid, sp in self._pressure_setpoints.items()
+        )
+        if length_converged or pressure_converged:
             self._phase_start = time.monotonic()
-            # Command orientation target for sim; the real backend sees commands
-            # via set_tendon_rate() during _tick_bending.
             if hasattr(self.backend, "set_orientation_target"):
-                # Convert target direction into pitch/roll (roll=0, pitch=theta in bend plane).
-                # For sim: project into pitch/roll according to phi.
                 target_pitch = self._theta_target * math.cos(self._phi_target)
                 target_roll = self._theta_target * math.sin(self._phi_target)
                 self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
@@ -271,31 +284,32 @@ class ExperimentController:
         return True
 
     def _command_module_pressures_for_length(self, L_total: float) -> None:
-        """Solve per-module pressures that sum to L_total using calibration curves.
+        """Command every non-excluded module to the operator pressure ceiling.
 
-        Simple strategy: equal fractional extension across modules. If a module
-        has no calibration (default), command a proportional pressure. Modules
-        in EXCLUDED_MODULES (e.g. module 6, no pressure sensor) are skipped.
+        The controller treats pressure as stiffness (bending comes from tendons),
+        so all active modules inflate to the same target during ELONGATING. If
+        per-module calibration is present, solve its quadratic for the target
+        arc length instead; otherwise default to the ceiling.
         """
         if self.cal.modules:
             active_ids = [mid for mid in self.cal.modules.keys() if mid not in self.EXCLUDED_MODULES]
         else:
             active_ids = [mid for mid in range(1, 7) if mid not in self.EXCLUDED_MODULES]
-        num = max(1, len(active_ids))
-        per_module = L_total / num
+        per_module = L_total / max(1, len(active_ids))
         for mid in active_ids:
+            baseline = (self._psi_baseline or {}).get(mid, 0.0)
             if self.cal.modules and mid in self.cal.modules:
                 m = self.cal.modules[mid]
                 a, b, c = m["coeffs"]
-                # Solve a + b*p + c*p^2 = per_module for p.
                 psi = _solve_psi_for_length(a, b, c, per_module, m["max_psi"])
+            elif self._pressure_ceiling_psi is not None:
+                psi = self._pressure_ceiling_psi
             else:
-                # Default: linear assumption, 40mm rest + 5mm/psi.
-                psi = max(0.0, (per_module - 40.0) / 5.0)
-            # Never command below the latched rest pressure — commanding
-            # 0 psi would tell the firmware to pull the module to vacuum.
-            if self._psi_baseline and mid in self._psi_baseline:
-                psi = max(psi, self._psi_baseline[mid])
+                psi = baseline
+            psi = max(psi, baseline)
+            if self._pressure_ceiling_psi is not None:
+                psi = min(psi, self._pressure_ceiling_psi)
+            self._pressure_setpoints[mid] = psi
             self.backend.set_module_pressure(mid, psi)
 
     # --- Angle-control path -----------------------------------------------
@@ -349,6 +363,7 @@ class ExperimentController:
         for sid in (1, 2, 3, 4):
             default = self._servo_defaults.get(sid, 0.0) if self._servo_defaults else 0.0
             angle = default + slack + bend.get(sid, 0.0)
+            self.last_tendon_angles[sid] = angle
             self.backend.set_tendon_angle(sid, angle)
 
 
