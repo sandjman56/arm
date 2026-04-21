@@ -21,28 +21,23 @@ struct MPUData {
 
 // Neutral angle and max deflection (degrees)
 #define BEND_CENTER_DEG 90
-#define BEND_MAX_DEG    60
+#define BEND_MAX_DEG    90
 
 Servo bendServoA;
 Servo bendServoB;
 Servo bendServoC;
 Servo bendServoD;
-int bendValue = 0;    // XY -100..100
-int bendValueXZ = 0;  // XZ -100..100
-int bendValueAll = 0; // All servos -100..100
 
-// Running center per servo. Shifts on CENTER (v=0) to latch the last commanded
-// angle, so subsequent slider moves are incremental from the held position
-// rather than snapping back to BEND_CENTER_DEG.
-int centerAngleA = BEND_CENTER_DEG;
-int centerAngleB = BEND_CENTER_DEG;
-int centerAngleC = BEND_CENTER_DEG;
-int centerAngleD = BEND_CENTER_DEG;
-// Last angle each servo was commanded to (source for the center latch).
-int lastAngleA = BEND_CENTER_DEG;
-int lastAngleB = BEND_CENTER_DEG;
-int lastAngleC = BEND_CENTER_DEG;
-int lastAngleD = BEND_CENTER_DEG;
+// Last angle each servo was commanded to. Updated on every SERVOS command.
+// Startup default positions (also re-applied on every boot).
+#define BEND_DEFAULT_A    -8
+#define BEND_DEFAULT_B   -11
+#define BEND_DEFAULT_C   157
+#define BEND_DEFAULT_D   272
+int lastAngleA = BEND_DEFAULT_A;
+int lastAngleB = BEND_DEFAULT_B;
+int lastAngleC = BEND_DEFAULT_C;
+int lastAngleD = BEND_DEFAULT_D;
 
 // =========================
 // I2C Multiplexer (PCA9548A)
@@ -190,11 +185,11 @@ Adafruit_MPRLS mpr = Adafruit_MPRLS();
 // =========================
 // Multi-module support
 // =========================
-#define MAX_MODULES 8
+#define MAX_MODULES 6
 
 // Pressure sensor channel mapping (via PCA9548A mux)
 #define NUM_PRESSURE_SENSORS 5
-uint8_t pressureChannels[MAX_MODULES] = {1, 0, 3, 4, 5};
+uint8_t pressureChannels[MAX_MODULES] = {3, 0, 1, 4, 5};
 // index 0 -> Module 1 on ch 1 (SD1/SC1)
 // index 1 -> Module 2 on ch 0 (SD0/SC0)
 // index 2 -> Module 3 on ch 3 (SD3/SC3)
@@ -210,6 +205,7 @@ struct Module {
   long minStepLimit;
   long maxStepLimit;
   bool limitsActive;
+  bool dirInvert;        // true = swap CW/CCW (motor wired backwards)
   // Non-blocking step state
   int  stepsRemaining;
   int  stepDirSign;      // +1 (CW) or -1 (CCW)
@@ -224,6 +220,10 @@ int moduleCount = 0;
 // Motion tuning
 // =========================
 const int BURST_STEPS = 40;
+// Pressure deadband (hPa). PID skips stepping when |err| is under this, so the
+// stepper doesn't hunt/overshoot on the ~0.1 psi pneumatic noise floor. 5 hPa
+// ≈ 0.07 psi.
+const float PID_DEADBAND_HPA = 5.0;
 const int STEP_DELAY_US = 2000;
 
 // =========================
@@ -249,9 +249,6 @@ float setpointHpaM[MAX_MODULES]     = {0};
 bool  pidEnabledM[MAX_MODULES]      = {false};
 float integralM[MAX_MODULES]        = {0};
 float lastErrorM[MAX_MODULES]       = {0};
-// Set true once PID has emitted a "blocked, no limits calibrated" warning for
-// this module, so the warning fires at most once per pid-enable cycle.
-bool  pidLimitWarned[MAX_MODULES]   = {false};
 
 // Legacy shared PID state (module 0 mirror); kept for diagnostics only.
 float integral = 0;
@@ -293,6 +290,7 @@ void initModule(int idx, int stepPin, int dirPin) {
   modules[idx].minStepLimit  = -999999L;
   modules[idx].maxStepLimit  = 999999L;
   modules[idx].limitsActive  = false;
+  modules[idx].dirInvert     = false;
   modules[idx].stepsRemaining = 0;
   modules[idx].stepDirSign   = 1;
   modules[idx].stepHigh      = false;
@@ -321,22 +319,32 @@ void setup() {
   pinMode(EN_PIN, OUTPUT);
   digitalWrite(EN_PIN, LOW);  // ENABLE DRIVER
 
-  // Default Module 1: STEP=3, DIR=4 (matches original wiring)
-  // Module 3: STEP=30, DIR=28
+  // M1: STEP=3,  DIR=4   (original wiring)
+  // M2: STEP=8,  DIR=7
+  // M3: STEP=30, DIR=28
+  // M4: STEP=34, DIR=32
+  // M5: STEP=36, DIR=38
+  // M6: STEP=42, DIR=40
   initModule(0, 3, 4);
   initModule(1, 8, 7);
   initModule(2, 30, 28);
-  moduleCount = 3;
+  initModule(3, 34, 32);
+  initModule(4, 36, 38);
+  initModule(5, 42, 40);
+  modules[4].dirInvert = true;  // M5 motor wired backwards
+  modules[5].dirInvert = true;  // M6 motor wired backwards
+  moduleCount = 6;
 
-  // Bend servos start detached (no power) — attached on demand by BEND command
-  pinMode(BEND_SERVO_A_PIN, OUTPUT);
-  pinMode(BEND_SERVO_B_PIN, OUTPUT);
-  pinMode(BEND_SERVO_C_PIN, OUTPUT);
-  pinMode(BEND_SERVO_D_PIN, OUTPUT);
-  digitalWrite(BEND_SERVO_A_PIN, LOW);
-  digitalWrite(BEND_SERVO_B_PIN, LOW);
-  digitalWrite(BEND_SERVO_C_PIN, LOW);
-  digitalWrite(BEND_SERVO_D_PIN, LOW);
+  // Attach bend servos on boot and drive to startup defaults so the arm
+  // starts in a known pose without waiting for a GUI command.
+  bendServoA.attach(BEND_SERVO_A_PIN, 500, 2500);
+  bendServoB.attach(BEND_SERVO_B_PIN, 500, 2500);
+  bendServoC.attach(BEND_SERVO_C_PIN, 500, 2500);
+  bendServoD.attach(BEND_SERVO_D_PIN, 500, 2500);
+  bendServoA.writeMicroseconds(map(BEND_DEFAULT_A, -360, 360, 500, 2500));
+  bendServoB.writeMicroseconds(map(BEND_DEFAULT_B, -360, 360, 500, 2500));
+  bendServoC.writeMicroseconds(map(BEND_DEFAULT_C, -360, 360, 500, 2500));
+  bendServoD.writeMicroseconds(map(BEND_DEFAULT_D, -360, 360, 500, 2500));
 
   // Initialize I2C bus
   Wire.begin();
@@ -395,7 +403,8 @@ void stepBurstModule(int idx, int dir) {
   if (idx < 0 || idx >= moduleCount || !modules[idx].active) return;
 
   Module &m = modules[idx];
-  int dirSign = (dir == DIR_CW) ? 1 : -1;
+  int effDir = m.dirInvert ? (dir == DIR_CW ? DIR_CCW : DIR_CW) : dir;
+  int dirSign = (effDir == DIR_CW) ? 1 : -1;
 
   // Check first step against limits before queuing.
   if (m.limitsActive) {
@@ -409,7 +418,7 @@ void stepBurstModule(int idx, int dir) {
     }
   }
 
-  digitalWrite(m.dirPin, dir);
+  digitalWrite(m.dirPin, effDir);
   m.stepDirSign    = dirSign;
   m.stepsRemaining = BURST_STEPS;
   m.stepHigh       = false;
@@ -524,7 +533,6 @@ void handleCommand(String cmd) {
     pidEnabledM[modIdx]  = true;
     integralM[modIdx]    = 0;
     lastErrorM[modIdx]   = 0;
-    pidLimitWarned[modIdx] = false;
     pidEnabled = true;  // master flag
 
     // Keep legacy single-module globals in sync when module 0 is targeted.
@@ -571,155 +579,73 @@ void handleCommand(String cmd) {
     stepBurstModule(idx, DIR_CW);
   }
 
-  // === Bend (XY plane servos) ===
-  // BEND,<int>  where int is -100..100. 0 = center.
-  // Legacy: BEND,LEFT | BEND,RIGHT | BEND,CENTER
-  else if (command == "BEND") {
-    int v;
-    if (args == "LEFT")       v = -100;
-    else if (args == "RIGHT") v =  100;
-    else if (args == "CENTER" || args.length() == 0) v = 0;
-    else                      v = args.toInt();
-
-    if (v < -100) v = -100;
-    if (v >  100) v =  100;
-    bendValue = v;
-
-    // Only one servo powered at a time. A = LEFT, B = RIGHT.
-    // Slider left (v<0) -> drive A, detach B. Slider right (v>0) -> drive B, detach A.
-    int mag = v < 0 ? -v : v;
-    int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleA = centerAngleA;
-    int angleB = centerAngleB;
-
-    if (v < 0) {
-      if (bendServoB.attached()) bendServoB.detach();
-      if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
-      angleA = constrain(centerAngleA + offset, 0, 180);
-      bendServoA.write(angleA);
-      lastAngleA = angleA;
-    } else if (v > 0) {
-      if (bendServoA.attached()) bendServoA.detach();
-      if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
-      angleB = constrain(centerAngleB + offset, 0, 180);
-      bendServoB.write(angleB);
-      lastAngleB = angleB;
-    } else {
-      // Latch last commanded angles as new centers. Keep the active servo
-      // attached and holding; do not detach on center.
-      centerAngleA = lastAngleA;
-      centerAngleB = lastAngleB;
-      if (bendServoA.attached()) bendServoA.write(lastAngleA);
-      if (bendServoB.attached()) bendServoB.write(lastAngleB);
-      angleA = lastAngleA;
-      angleB = lastAngleB;
+  // === Bend servo single set ===
+  // SERVO,<id>,<angle>  — id is 1..4 (A/B/C/D -> pins 9/10/11/24),
+  // angle is 0..180. Attaches the servo if detached and holds it at
+  // the commanded angle. Sent live as the GUI slider is dragged.
+  else if (command == "SERVO") {
+    int c1 = args.indexOf(',');
+    if (c1 < 0) {
+      Serial.println("SERVO FAIL need id,angle");
+      return;
     }
+    int id    = args.substring(0, c1).toInt();
+    int angle = constrain(args.substring(c1 + 1).toInt(), -360, 360);
+    Servo *s = nullptr;
+    int pin = -1;
+    int *lastAngle = nullptr;
+    switch (id) {
+      case 1: s = &bendServoA; pin = BEND_SERVO_A_PIN; lastAngle = &lastAngleA; break;
+      case 2: s = &bendServoB; pin = BEND_SERVO_B_PIN; lastAngle = &lastAngleB; break;
+      case 3: s = &bendServoC; pin = BEND_SERVO_C_PIN; lastAngle = &lastAngleC; break;
+      case 4: s = &bendServoD; pin = BEND_SERVO_D_PIN; lastAngle = &lastAngleD; break;
+      default:
+        Serial.print("SERVO FAIL bad_id ");
+        Serial.println(id);
+        return;
+    }
+    if (!s->attached()) s->attach(pin, 500, 2500);
+    s->writeMicroseconds(map(angle, -360, 360, 500, 2500));
+    *lastAngle = angle;
 
-    Serial.print("BEND ");
-    Serial.print(v);
-    Serial.print(" A=");
-    Serial.print(angleA);
-    Serial.print(" B=");
-    Serial.println(angleB);
+    Serial.print("SERVO ");
+    Serial.print(id);
+    Serial.print(" ");
+    Serial.println(angle);
   }
 
-  // === Bend XZ plane (servos C/D) ===
-  // BEND_XZ,<int>  where int is -100..100. 0 = center.
-  else if (command == "BEND_XZ") {
-    int v;
-    if (args == "CENTER" || args.length() == 0) v = 0;
-    else                                        v = args.toInt();
-
-    if (v < -100) v = -100;
-    if (v >  100) v =  100;
-    bendValueXZ = v;
-
-    int mag = v < 0 ? -v : v;
-    int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-    int angleC = centerAngleC;
-    int angleD = centerAngleD;
-
-    if (v < 0) {
-      if (bendServoD.attached()) bendServoD.detach();
-      if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
-      angleC = constrain(centerAngleC + offset, 0, 180);
-      bendServoC.write(angleC);
-      lastAngleC = angleC;
-    } else if (v > 0) {
-      if (bendServoC.attached()) bendServoC.detach();
-      if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
-      angleD = constrain(centerAngleD + offset, 0, 180);
-      bendServoD.write(angleD);
-      lastAngleD = angleD;
-    } else {
-      // Latch last commanded angles as new centers. Keep the active servo
-      // attached and holding; do not detach on center.
-      centerAngleC = lastAngleC;
-      centerAngleD = lastAngleD;
-      if (bendServoC.attached()) bendServoC.write(lastAngleC);
-      if (bendServoD.attached()) bendServoD.write(lastAngleD);
-      angleC = lastAngleC;
-      angleD = lastAngleD;
+  // === Bend servo bulk set ===
+  // SERVOS,<a>,<b>,<c>,<d>  — absolute angles (0..180) for servos A/B/C/D
+  // (pins 9/10/11/24). Writes all four at once. Used by the GUI "Save"
+  // button to resend the current state.
+  else if (command == "SERVOS") {
+    int c1 = args.indexOf(',');
+    int c2 = (c1 >= 0) ? args.indexOf(',', c1 + 1) : -1;
+    int c3 = (c2 >= 0) ? args.indexOf(',', c2 + 1) : -1;
+    if (c1 < 0 || c2 < 0 || c3 < 0) {
+      Serial.println("SERVOS FAIL need a,b,c,d");
+      return;
     }
+    int aA = constrain(args.substring(0, c1).toInt(),       -360, 360);
+    int aB = constrain(args.substring(c1 + 1, c2).toInt(),  -360, 360);
+    int aC = constrain(args.substring(c2 + 1, c3).toInt(),  -360, 360);
+    int aD = constrain(args.substring(c3 + 1).toInt(),      -360, 360);
 
-    Serial.print("BEND_XZ ");
-    Serial.print(v);
-    Serial.print(" C=");
-    Serial.print(angleC);
-    Serial.print(" D=");
-    Serial.println(angleD);
-  }
+    if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN, 500, 2500);
+    if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN, 500, 2500);
+    if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN, 500, 2500);
+    if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN, 500, 2500);
 
-  // === Bend ALL servos to the same angle ===
-  // BEND_ALL,<int>  where int is -100..100. 0 = center/detach.
-  else if (command == "BEND_ALL") {
-    int v;
-    if (args == "CENTER" || args.length() == 0) v = 0;
-    else                                        v = args.toInt();
+    bendServoA.writeMicroseconds(map(aA, -360, 360, 500, 2500)); lastAngleA = aA;
+    bendServoB.writeMicroseconds(map(aB, -360, 360, 500, 2500)); lastAngleB = aB;
+    bendServoC.writeMicroseconds(map(aC, -360, 360, 500, 2500)); lastAngleC = aC;
+    bendServoD.writeMicroseconds(map(aD, -360, 360, 500, 2500)); lastAngleD = aD;
 
-    if (v < -100) v = -100;
-    if (v >  100) v =  100;
-    bendValueAll = v;
-
-    int allAngle = BEND_CENTER_DEG;
-    if (v == 0) {
-      // Latch each servo's last commanded angle as its new center. Keep
-      // whichever servos are attached holding their positions.
-      centerAngleA = lastAngleA;
-      centerAngleB = lastAngleB;
-      centerAngleC = lastAngleC;
-      centerAngleD = lastAngleD;
-      if (bendServoA.attached()) bendServoA.write(lastAngleA);
-      if (bendServoB.attached()) bendServoB.write(lastAngleB);
-      if (bendServoC.attached()) bendServoC.write(lastAngleC);
-      if (bendServoD.attached()) bendServoD.write(lastAngleD);
-      allAngle = lastAngleA;
-    } else {
-      int mag = v < 0 ? -v : v;
-      int offset = (int)((long)mag * BEND_MAX_DEG / 100);
-      int signedOffset = (v > 0) ? offset : -offset;
-
-      if (!bendServoA.attached()) bendServoA.attach(BEND_SERVO_A_PIN);
-      if (!bendServoB.attached()) bendServoB.attach(BEND_SERVO_B_PIN);
-      if (!bendServoC.attached()) bendServoC.attach(BEND_SERVO_C_PIN);
-      if (!bendServoD.attached()) bendServoD.attach(BEND_SERVO_D_PIN);
-
-      int aA = constrain(centerAngleA + signedOffset, 0, 180);
-      int aB = constrain(centerAngleB + signedOffset, 0, 180);
-      int aC = constrain(centerAngleC + signedOffset, 0, 180);
-      int aD = constrain(centerAngleD + signedOffset, 0, 180);
-
-      bendServoA.write(aA); lastAngleA = aA;
-      bendServoB.write(aB); lastAngleB = aB;
-      bendServoC.write(aC); lastAngleC = aC;
-      bendServoD.write(aD); lastAngleD = aD;
-      allAngle = aA;
-    }
-
-    Serial.print("BEND_ALL ");
-    Serial.print(v);
-    Serial.print(" angle=");
-    Serial.println(allAngle);
+    Serial.print("SERVOS ");
+    Serial.print(aA); Serial.print(",");
+    Serial.print(aB); Serial.print(",");
+    Serial.print(aC); Serial.print(",");
+    Serial.println(aD);
   }
 
   else if (command == "DEFLATE") {
@@ -1011,22 +937,16 @@ void loop() {
     for (int i = 0; i < moduleCount; i++) {
       if (!pidEnabledM[i]) continue;
       if (!modules[i].active) continue;
-      // Defensive: refuse to auto-step a module whose stepper limits have not
-      // been calibrated. Experiments mode drives the rig via pressure (SET),
-      // which enables PID here — without this guard, an uncalibrated module
-      // could be driven past its physical wall. Burst/one-shot commands (e.g.
-      // INFLATE/DEFLATE) bypass this loop and still work during calibration.
-      if (!modules[i].limitsActive) {
-        if (!pidLimitWarned[i]) {
-          Serial.print("PID_BLOCKED_NO_LIMITS M");
-          Serial.println(i + 1);
-          pidLimitWarned[i] = true;
-        }
-        continue;
-      }
       if (modules[i].stepsRemaining > 0) continue;  // mid-burst, wait
 
       float err = setpointHpaM[i] - currentPressureM[i];
+
+      // Deadband: within tolerance of setpoint, hold position and freeze the
+      // integrator so it doesn't wind up on sensor noise.
+      if (fabs(err) < PID_DEADBAND_HPA) {
+        lastErrorM[i] = err;
+        continue;
+      }
 
       integralM[i] += err * 0.025;
       float derivative = (err - lastErrorM[i]) / 0.025;

@@ -41,7 +41,6 @@ class ExperimentPanel(tk.Frame):
         on_start_zero,
         on_confirm_zero,
         on_rezero,
-        on_recalibrate_length,
         on_reach,
         on_emergency_stop,
         **kwargs,
@@ -50,7 +49,6 @@ class ExperimentPanel(tk.Frame):
         self._on_start_zero = on_start_zero
         self._on_confirm_zero = on_confirm_zero
         self._on_rezero = on_rezero
-        self._on_recalibrate_length = on_recalibrate_length
         self._on_reach = on_reach
         self._on_emergency_stop = on_emergency_stop
 
@@ -102,8 +100,6 @@ class ExperimentPanel(tk.Frame):
                      command=self._on_confirm_zero).pack(side="left", padx=3)
         AccentButton(btn_row, text="Re-zero",
                      command=self._on_rezero).pack(side="left", padx=3)
-        AccentButton(btn_row, text="Recalibrate Length", accent=ACCENT_ORANGE,
-                     command=self._on_recalibrate_length).pack(side="left", padx=3)
         tk.Label(btn_row, textvariable=self.backend_badge_var,
                  font=FONT_LABEL, fg=ACCENT_ORANGE, bg=BG_PANEL).pack(side="right", padx=10)
         tk.Label(btn_row, textvariable=self.status_var,
@@ -120,11 +116,15 @@ class ExperimentPanel(tk.Frame):
 
         readout = tk.Frame(self, bg=BG_PANEL)
         readout.pack(fill="x", padx=10, pady=4, side="bottom")
+        self._phase_label: Optional[tk.Label] = None
         for var in (self.tip_from_zero_var, self.tip_from_base_var,
                     self.orient_var, self.yaw_drift_var,
                     self.phase_var, self.error_var):
-            tk.Label(readout, textvariable=var, font=FONT_BODY,
-                     fg=TEXT_PRIMARY, bg=BG_PANEL).pack(anchor="w")
+            lbl = tk.Label(readout, textvariable=var, font=FONT_BODY,
+                           fg=TEXT_PRIMARY, bg=BG_PANEL)
+            lbl.pack(anchor="w")
+            if var is self.phase_var:
+                self._phase_label = lbl
 
         tgt_row = tk.Frame(self, bg=BG_PANEL)
         tgt_row.pack(fill="x", padx=10, pady=(4, 4), side="bottom")
@@ -246,6 +246,14 @@ class ExperimentPanel(tk.Frame):
         self.yaw_drift_var.set(f"Yaw drift: {yaw_drift_deg_per_min:.2f}°/min")
         self.phase_var.set(f"Phase: {phase}")
         self.error_var.set(error_text)
+        # REACHED visuals: green phase label + green target dots across all
+        # three canvases. Red everywhere else.
+        reached = (phase == "REACHED")
+        if self._phase_label is not None:
+            self._phase_label.configure(fg=ACCENT_GREEN if reached else TEXT_PRIMARY)
+        self.xy_picker.set_reached(reached)
+        self.xz_picker.set_reached(reached)
+        self.preview3d.set_reached(reached)
 
     def set_tip_position(self, tip_display: Tuple[float, float, float],
                          arc_points_physics: list) -> None:

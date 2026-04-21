@@ -65,3 +65,8 @@ def fmt_tendon(servo_id: int, rate: float) -> str:
     # rate in [-1, 1]; scaled to a firmware-understood int 0-1000 with sign.
     scaled = int(round(max(-1.0, min(1.0, rate)) * 1000))
     return f"TEND {servo_id} {scaled}"
+
+
+def fmt_tendon_angle(servo_id: int, angle_deg: float) -> str:
+    # Absolute-angle command via the firmware's SERVO path.
+    return f"SERVO,{servo_id},{int(round(angle_deg))}"

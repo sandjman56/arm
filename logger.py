@@ -18,6 +18,15 @@ class CSVLogger:
     def is_active(self):
         return self._active
 
+    HEADER = [
+        "time", "timestamp",
+        "p1", "p2", "p3", "p4", "p5",
+        "ax", "ay", "az", "gx", "gy", "gz",
+        "s1", "s2", "s3", "s4",
+        "pitch_deg", "roll_deg", "yaw_deg",
+        "phase",
+    ]
+
     def start(self):
         """Start logging. Returns the filename."""
         if self._active:
@@ -26,7 +35,7 @@ class CSVLogger:
         path = os.path.join(self.output_dir, name)
         self._file = open(path, "w", newline="")
         self._writer = csv.writer(self._file)
-        self._writer.writerow(["time", "timestamp", "p1", "p2", "p3", "p4"])
+        self._writer.writerow(self.HEADER)
         self._start_time = time.time()
         self._active = True
         return name
