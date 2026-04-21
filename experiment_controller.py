@@ -4,7 +4,7 @@ import enum
 import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from experiment_backend import Backend
 from length_calibration import LengthCalibration
@@ -33,8 +33,13 @@ class ExperimentController:
     BEND_TIMEOUT_S = 15.0
     TOL_ANGLE_RAD = math.radians(3)
     TOL_POS_MM = 10.0
-    KP_BEND = 4.0
+    KP_BEND = 4.0                 # legacy rate gain (unused when servo_defaults is set)
+    KP_BEND_ANGLE_DEG_PER_RAD = 30.0
+    BEND_ANGLE_MAX_DEG = 45.0
     OMEGA_MAX = 1.0  # tendon rate saturation, in [-1, 1]
+    SLACK_PER_PSI = 10.0 / 0.3    # degrees of tendon slack per psi of aggregate module delta
+    SLACK_MAX_DEG = 90.0          # absolute clamp on magnitude of slack offset
+    EXCLUDED_MODULES = frozenset({6})  # no pressure sensor wired; skip for baseline/slack/pressurize
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -43,6 +48,11 @@ class ExperimentController:
         self._target: Optional[Tuple[float, float, float]] = None  # in physics frame
         self._phase_start: float = 0.0
         self._last_result: Optional[RunResult] = None
+        # Pressure-driven tendon-slack state. Baseline latched at confirm_zero;
+        # servo defaults latched at reach(). Angle-control path is active only
+        # while both are populated.
+        self._psi_baseline: Optional[Dict[int, float]] = None
+        self._servo_defaults: Optional[Dict[int, float]] = None
 
     # --- Transitions -------------------------------------------------------
 
@@ -53,12 +63,21 @@ class ExperimentController:
         if self.state != State.ZEROING:
             return
         self.backend.capture_zero()
+        # Latch pressure baseline for tendon-slack compensation, excluding
+        # modules without pressure sensors (see EXCLUDED_MODULES).
+        pressures = self.backend.read_state().module_pressures_psi
+        self._psi_baseline = {
+            mid: p for mid, p in pressures.items() if mid not in self.EXCLUDED_MODULES
+        }
         self.state = State.WAITING_FOR_TARGET
 
     def emergency_stop(self) -> None:
         self.backend.emergency_stop()
         self.state = State.IDLE
         self._target = None
+        # Disengage the angle-control path. Baseline stays; operator must
+        # re-Reach to re-arm tendon writes.
+        self._servo_defaults = None
 
     @property
     def last_result(self) -> Optional[RunResult]:
@@ -66,10 +85,25 @@ class ExperimentController:
 
     # --- Reach -------------------------------------------------------------
 
-    def reach(self, target: Tuple[float, float, float]) -> None:
-        """Begin a reach attempt to `target` in the physics frame."""
+    def reach(
+        self,
+        target: Tuple[float, float, float],
+        servo_defaults: Optional[Dict[int, float]] = None,
+    ) -> None:
+        """Begin a reach attempt to `target` in the physics frame.
+
+        `servo_defaults` is a {1..4: angle_deg} dict of the operator's current
+        tendon-servo angles. When provided, the controller uses absolute-angle
+        control with pressure-driven slack compensation; the bend P-controller
+        composes on top (common-mode slack + differential-mode bend). When
+        omitted, the legacy rate-based path is used (tests, simulation).
+        """
         if self.state != State.WAITING_FOR_TARGET and self.state != State.REACHED:
             return
+        if servo_defaults is not None and self._psi_baseline is None:
+            raise ValueError(
+                "pressure baseline not captured — press Confirm Zero before Reach"
+            )
         from kinematics import is_reachable, inverse_kinematics
         theta_max = math.radians(60)
         if not is_reachable(target, L_min=self.cal.L_rest, L_max=self.cal.L_max, theta_max=theta_max):
@@ -81,13 +115,18 @@ class ExperimentController:
         self._theta_target = theta_target
         self._phi_target = phi_target
         self._phase_start = time.monotonic()
-        # Command module pressures. For default calibration, split evenly.
-        self._command_module_pressures_for_length(L_target)
-        # In sim mode, also poke the backend with the total length directly
-        # so its slewing engine has a target.
+        # Latch servo defaults (by value). None disables the angle-control path.
+        self._servo_defaults = dict(servo_defaults) if servo_defaults is not None else None
+        # In sim mode, poke the backend with the target orientation so its
+        # slewing engine converges during BENDING.
         if hasattr(self.backend, "set_total_length_target"):
             self.backend.set_total_length_target(L_target)
-        self.state = State.ELONGATING
+        if hasattr(self.backend, "set_orientation_target"):
+            target_pitch = theta_target * math.cos(phi_target)
+            target_roll = theta_target * math.sin(phi_target)
+            self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
+        # No pressure-driven elongation: L_rest == L_max. Go straight to bending.
+        self.state = State.BENDING
 
     # --- Main tick ---------------------------------------------------------
 
@@ -100,6 +139,13 @@ class ExperimentController:
             self._tick_elongating()
         elif self.state == State.BENDING:
             self._tick_bending()
+
+        # Angle-control path: whenever defaults + baseline are latched, write
+        # composed tendon angles each tick so (a) slack tracks pressure smoothly
+        # during elongation/deflation, and (b) the bend P-controller layers on
+        # top during BENDING. Inactive in tests/sim that pass no defaults.
+        if self._servo_defaults is not None and self._psi_baseline is not None:
+            self._update_tendon_angles()
 
     def _tick_elongating(self) -> None:
         s = self.backend.read_state()
@@ -172,33 +218,41 @@ class ExperimentController:
         ang_err = math.hypot(err_pitch, err_roll)
 
         if ang_err < self.TOL_ANGLE_RAD and pos_err < self.TOL_POS_MM:
-            # Halt tendons and declare REACHED.
-            for sid in (1, 2, 3, 4):
-                self.backend.set_tendon_rate(sid, 0.0)
+            # Halt the bend P-controller; tendons hold at their last commanded
+            # angle (firmware latches). Slack continues to track pressure via
+            # _update_tendon_angles() in subsequent ticks.
+            if self._servo_defaults is None:
+                for sid in (1, 2, 3, 4):
+                    self.backend.set_tendon_rate(sid, 0.0)
             self._finish(timed_out=False)
             return
 
         if elapsed > self.BEND_TIMEOUT_S:
-            for sid in (1, 2, 3, 4):
-                self.backend.set_tendon_rate(sid, 0.0)
+            if self._servo_defaults is None:
+                for sid in (1, 2, 3, 4):
+                    self.backend.set_tendon_rate(sid, 0.0)
             self._finish(timed_out=True)
             return
 
-        # 4-tendon antagonistic mapping:
-        # servo 1 at 0 deg  winds to pull +pitch
-        # servo 3 at 180 deg winds to pull -pitch
-        # servo 2 at 90 deg winds to pull +roll
-        # servo 4 at 270 deg winds to pull -roll
-        u_pitch = self.KP_BEND * err_pitch
-        u_roll = self.KP_BEND * err_roll
-        rate_1 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_pitch))
-        rate_3 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_pitch))
-        rate_2 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_roll))
-        rate_4 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_roll))
-        self.backend.set_tendon_rate(1, rate_1)
-        self.backend.set_tendon_rate(2, rate_2)
-        self.backend.set_tendon_rate(3, rate_3)
-        self.backend.set_tendon_rate(4, rate_4)
+        # Angle-control path handles bend writes in _update_tendon_angles().
+        # Legacy rate-control path is only engaged when no servo_defaults were
+        # provided (tests, headless sim).
+        if self._servo_defaults is None:
+            # 4-tendon antagonistic mapping:
+            # servo 1 at 0 deg  winds to pull +pitch
+            # servo 3 at 180 deg winds to pull -pitch
+            # servo 2 at 90 deg winds to pull +roll
+            # servo 4 at 270 deg winds to pull -roll
+            u_pitch = self.KP_BEND * err_pitch
+            u_roll = self.KP_BEND * err_roll
+            rate_1 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_pitch))
+            rate_3 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_pitch))
+            rate_2 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, +u_roll))
+            rate_4 = max(-self.OMEGA_MAX, min(self.OMEGA_MAX, -u_roll))
+            self.backend.set_tendon_rate(1, rate_1)
+            self.backend.set_tendon_rate(2, rate_2)
+            self.backend.set_tendon_rate(3, rate_3)
+            self.backend.set_tendon_rate(4, rate_4)
 
     # --- Re-zero guard -----------------------------------------------------
 
@@ -220,12 +274,17 @@ class ExperimentController:
         """Solve per-module pressures that sum to L_total using calibration curves.
 
         Simple strategy: equal fractional extension across modules. If a module
-        has no calibration (default), command a proportional pressure.
+        has no calibration (default), command a proportional pressure. Modules
+        in EXCLUDED_MODULES (e.g. module 6, no pressure sensor) are skipped.
         """
-        num = max(1, len(self.cal.modules) or 6)
+        if self.cal.modules:
+            active_ids = [mid for mid in self.cal.modules.keys() if mid not in self.EXCLUDED_MODULES]
+        else:
+            active_ids = [mid for mid in range(1, 7) if mid not in self.EXCLUDED_MODULES]
+        num = max(1, len(active_ids))
         per_module = L_total / num
-        for mid in (self.cal.modules.keys() if self.cal.modules else range(1, num + 1)):
-            if self.cal.modules:
+        for mid in active_ids:
+            if self.cal.modules and mid in self.cal.modules:
                 m = self.cal.modules[mid]
                 a, b, c = m["coeffs"]
                 # Solve a + b*p + c*p^2 = per_module for p.
@@ -233,7 +292,64 @@ class ExperimentController:
             else:
                 # Default: linear assumption, 40mm rest + 5mm/psi.
                 psi = max(0.0, (per_module - 40.0) / 5.0)
+            # Never command below the latched rest pressure — commanding
+            # 0 psi would tell the firmware to pull the module to vacuum.
+            if self._psi_baseline and mid in self._psi_baseline:
+                psi = max(psi, self._psi_baseline[mid])
             self.backend.set_module_pressure(mid, psi)
+
+    # --- Angle-control path -----------------------------------------------
+
+    def _compute_slack_deg(self) -> float:
+        """Common-mode tendon slack (negative = pay out) from aggregate Δpsi.
+
+        Slack = −Σ max(0, psi_m − baseline_m) × (10 / 0.3) degrees, summed
+        over non-excluded modules. Clamped to [−SLACK_MAX_DEG, 0]. Symmetric
+        deflation returns to 0 naturally via the max(0, …) floor and the
+        instantaneous pressure reading.
+        """
+        if self._psi_baseline is None:
+            return 0.0
+        pressures = self.backend.read_state().module_pressures_psi
+        sum_delta = 0.0
+        for mid, base in self._psi_baseline.items():
+            cur = pressures.get(mid, base)
+            sum_delta += max(0.0, cur - base)
+        slack = -sum_delta * self.SLACK_PER_PSI
+        # Never over-tension past defaults; never exceed safety clamp.
+        return max(-self.SLACK_MAX_DEG, min(0.0, slack))
+
+    def _compute_bend_offsets_deg(self) -> Dict[int, float]:
+        """Differential-mode P-controller offsets (degrees) per tendon.
+
+        Zero outside BENDING. 1↔3 antagonistic for pitch, 2↔4 for roll.
+        """
+        if self.state != State.BENDING:
+            return {1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0}
+        pitch, roll, _yaw = self.backend.read_orientation()
+        target_pitch = self._theta_target * math.cos(self._phi_target)
+        target_roll = self._theta_target * math.sin(self._phi_target)
+        err_pitch = target_pitch - pitch
+        err_roll = target_roll - roll
+        k = self.KP_BEND_ANGLE_DEG_PER_RAD
+        lim = self.BEND_ANGLE_MAX_DEG
+        u_pitch = max(-lim, min(lim, k * err_pitch))
+        u_roll = max(-lim, min(lim, k * err_roll))
+        return {
+            1: +u_pitch,
+            3: -u_pitch,
+            2: +u_roll,
+            4: -u_roll,
+        }
+
+    def _update_tendon_angles(self) -> None:
+        """Write composed absolute angles to all 4 tendon servos."""
+        slack = self._compute_slack_deg()
+        bend = self._compute_bend_offsets_deg()
+        for sid in (1, 2, 3, 4):
+            default = self._servo_defaults.get(sid, 0.0) if self._servo_defaults else 0.0
+            angle = default + slack + bend.get(sid, 0.0)
+            self.backend.set_tendon_angle(sid, angle)
 
 
 def _solve_psi_for_length(a: float, b: float, c: float, target_len: float, max_psi: float) -> float:

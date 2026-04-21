@@ -41,7 +41,6 @@ class ExperimentPanel(tk.Frame):
         on_start_zero,
         on_confirm_zero,
         on_rezero,
-        on_recalibrate_length,
         on_reach,
         on_emergency_stop,
         **kwargs,
@@ -50,7 +49,6 @@ class ExperimentPanel(tk.Frame):
         self._on_start_zero = on_start_zero
         self._on_confirm_zero = on_confirm_zero
         self._on_rezero = on_rezero
-        self._on_recalibrate_length = on_recalibrate_length
         self._on_reach = on_reach
         self._on_emergency_stop = on_emergency_stop
 
@@ -102,8 +100,6 @@ class ExperimentPanel(tk.Frame):
                      command=self._on_confirm_zero).pack(side="left", padx=3)
         AccentButton(btn_row, text="Re-zero",
                      command=self._on_rezero).pack(side="left", padx=3)
-        AccentButton(btn_row, text="Recalibrate Length", accent=ACCENT_ORANGE,
-                     command=self._on_recalibrate_length).pack(side="left", padx=3)
         tk.Label(btn_row, textvariable=self.backend_badge_var,
                  font=FONT_LABEL, fg=ACCENT_ORANGE, bg=BG_PANEL).pack(side="right", padx=10)
         tk.Label(btn_row, textvariable=self.status_var,

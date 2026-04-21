@@ -40,6 +40,10 @@ class Backend(ABC):
     def set_tendon_rate(self, servo_id: int, rate: float) -> None:
         """Command a continuous-rotation servo. rate in [-1, 1]."""
 
+    def set_tendon_angle(self, servo_id: int, angle_deg: float) -> None:
+        """Command an absolute servo angle. Default: no-op (sim)."""
+        pass
+
     @abstractmethod
     def capture_zero(self) -> None: ...
 
@@ -74,6 +78,7 @@ class SimBackend(Backend):
         self._length_mm = L_rest
         self._length_target = L_rest
         self._pressures: Dict[int, float] = {i + 1: 0.0 for i in range(num_modules)}
+        self._last_tendon_angles: Dict[int, float] = {}
         # Orientation state (absolute, pre-zero-offset).
         self._pitch = 0.0
         self._roll = 0.0
@@ -104,6 +109,9 @@ class SimBackend(Backend):
         # Pressure is instantaneous in sim. The controller drives length via
         # set_total_length_target() directly.
         self._pressures[module_id] = target_psi
+
+    def set_tendon_angle(self, servo_id: int, angle_deg: float) -> None:
+        self._last_tendon_angles[servo_id] = angle_deg
 
     def set_tendon_rate(self, servo_id: int, rate: float) -> None:
         # Interpret tendon pulls as orientation intent: servo 1 (0 deg) pulls
@@ -170,7 +178,7 @@ def _slew(current: float, target: float, max_step: float) -> float:
 
 import time
 from orientation import OrientationEstimator
-from arduino_interface import fmt_set_module, fmt_tendon
+from arduino_interface import fmt_set_module, fmt_tendon, fmt_tendon_angle
 
 
 class LiveBackend(Backend):
@@ -224,6 +232,9 @@ class LiveBackend(Backend):
 
     def set_tendon_rate(self, servo_id: int, rate: float) -> None:
         self._arduino.send(fmt_tendon(servo_id, rate))
+
+    def set_tendon_angle(self, servo_id: int, angle_deg: float) -> None:
+        self._arduino.send(fmt_tendon_angle(servo_id, angle_deg))
 
     def capture_zero(self) -> None:
         self._orient.capture_zero()

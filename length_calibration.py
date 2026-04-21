@@ -12,8 +12,8 @@ from typing import Dict, List, Optional
 
 
 DEFAULT_WORKSPACE = {
-    "L_rest_mm": 240.0,   # total rest length assuming 6 modules of 40mm
-    "L_max_mm": 480.0,    # total max length assuming 6 modules of 80mm
+    "L_rest_mm": 88.9,
+    "L_max_mm": 88.9,
     "theta_max_rad": 1.0472,  # 60 degrees
 }
 

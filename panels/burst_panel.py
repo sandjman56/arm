@@ -18,6 +18,11 @@ class BurstPanel(tk.Frame):
         self._on_send = on_send
         self._on_emergency_stop = on_emergency_stop
 
+        # One IntVar per servo (A/B/C/D -> pins 9/10/11/24). Sliders are
+        # UI-only; angles are not sent to the firmware until Save is pressed.
+        self._servo_defaults = (-8, -11, 157, 272)
+        self._servo_vars = [tk.IntVar(value=v) for v in self._servo_defaults]
+
         self._build()
 
     def _build(self):
@@ -43,135 +48,76 @@ class BurstPanel(tk.Frame):
         self._infl_frame.pack(fill="both", expand=True, padx=5, pady=5)
         self._rebuild_modules()
 
-        # Right: Bending controls
+        # Right: Per-servo bend controls. Sliders set target angles; nothing
+        # is sent to the firmware until Save is pressed, so the arm doesn't
+        # move as the user drags.
         right = tk.Frame(main, bg=BG_PANEL)
         right.pack(side="right", fill="both", padx=5)
 
         bend_header = tk.Frame(right, bg=BG_PANEL)
         bend_header.pack(fill="x")
         tk.Frame(bend_header, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
-        tk.Label(bend_header, text="BENDING", font=FONT_LABEL,
+        tk.Label(bend_header, text="SERVOS", font=FONT_LABEL,
                 fg=ACCENT_CYAN_DIM, bg=BG_PANEL).pack(anchor="w", padx=5, pady=(3, 0))
 
         bend_box = tk.Frame(right, bg=BG_PANEL)
         bend_box.pack(pady=10, padx=10, fill="both")
 
-        # Horizontal layout: vertical slider on left, horizontal sliders on right
-        bend_row = tk.Frame(bend_box, bg=BG_PANEL)
-        bend_row.pack(fill="both", expand=True)
+        # One horizontal slider per servo, 0..180°, starting at 90 (center).
+        # Each slider writes its angle live as the user drags so the physical
+        # servo tracks the slider. Save resends all four as a safety/confirm.
+        servo_labels = [
+            ("Servo A (pin 9)",  1),
+            ("Servo B (pin 10)", 2),
+            ("Servo C (pin 11)", 3),
+            ("Servo D (pin 24)", 4),
+        ]
+        for label, servo_id in servo_labels:
+            header = tk.Frame(bend_box, bg=BG_PANEL)
+            header.pack(fill="x")
+            tk.Label(header, text=label, font=FONT_LABEL,
+                     fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+            tk.Button(
+                header, text="\u25B6", font=("Courier", 9),
+                fg=ACCENT_CYAN, bg=BG_PANEL, activebackground=BG_PRIMARY,
+                activeforeground=ACCENT_CYAN, bd=0, padx=4, pady=0,
+                highlightthickness=0,
+                command=lambda sid=servo_id: self._nudge_servo(sid, +5),
+            ).pack(side="right")
+            tk.Button(
+                header, text="\u25C0", font=("Courier", 9),
+                fg=ACCENT_CYAN, bg=BG_PANEL, activebackground=BG_PRIMARY,
+                activeforeground=ACCENT_CYAN, bd=0, padx=4, pady=0,
+                highlightthickness=0,
+                command=lambda sid=servo_id: self._nudge_servo(sid, -5),
+            ).pack(side="right")
+            tk.Scale(
+                bend_box, from_=-360, to=360, orient="horizontal",
+                variable=self._servo_vars[servo_id - 1], showvalue=True,
+                length=220,
+                bg=BG_PANEL, fg=TEXT_PRIMARY, troughcolor=BG_PRIMARY,
+                highlightthickness=0, activebackground=ACCENT_CYAN,
+                command=lambda val, sid=servo_id:
+                    self._on_send(f"SERVO,{sid},{int(float(val))}"),
+            ).pack(pady=(0, 6), fill="x")
 
-        # --- Left: All-servos vertical slider ---
-        all_col = tk.Frame(bend_row, bg=BG_PANEL)
-        all_col.pack(side="left", padx=(0, 15), anchor="n")
-
-        tk.Label(all_col, text="All Servos", font=FONT_LABEL,
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack()
-        tk.Label(all_col, text="Up", font=("Courier", 8),
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack()
-
-        self._bend_all_val = tk.IntVar(value=0)
-        self._bend_all_slider = tk.Scale(
-            all_col, from_=100, to=-100, orient="vertical",
-            variable=self._bend_all_val, showvalue=True, length=180,
-            bg=BG_PANEL, fg=TEXT_PRIMARY, troughcolor=BG_PRIMARY,
-            highlightthickness=0, activebackground=ACCENT_CYAN,
-            command=self._on_bend_all_slide,
-        )
-        self._bend_all_slider.pack(pady=2)
-        self._bend_all_slider.bind("<ButtonRelease-1>", self._on_bend_all_release)
-
-        tk.Label(all_col, text="Down", font=("Courier", 8),
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack()
-        AccentButton(all_col, text="Center", width=8,
-                     command=self._bend_all_center).pack(pady=(6, 0))
-
-        # --- Right: XY and XZ horizontal sliders stacked ---
-        hz_col = tk.Frame(bend_row, bg=BG_PANEL)
-        hz_col.pack(side="left", fill="both", expand=True, anchor="n")
-
-        tk.Label(hz_col, text="XY Plane", font=FONT_LABEL,
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack()
-
-        self._bend_val = tk.IntVar(value=0)
-        self._bend_slider = tk.Scale(
-            hz_col, from_=-100, to=100, orient="horizontal",
-            variable=self._bend_val, showvalue=True, length=180,
-            bg=BG_PANEL, fg=TEXT_PRIMARY, troughcolor=BG_PRIMARY,
-            highlightthickness=0, activebackground=ACCENT_CYAN,
-            command=self._on_bend_slide,
-        )
-        self._bend_slider.pack(pady=5)
-        self._bend_slider.bind("<ButtonRelease-1>", self._on_bend_release)
-
-        row = tk.Frame(hz_col, bg=BG_PANEL)
-        row.pack()
-        tk.Label(row, text="L", font=FONT_LABEL, fg=TEXT_SECONDARY,
-                 bg=BG_PANEL).pack(side="left", padx=(0, 60))
-        tk.Label(row, text="R", font=FONT_LABEL, fg=TEXT_SECONDARY,
-                 bg=BG_PANEL).pack(side="left")
-
-        AccentButton(hz_col, text="Center", width=8,
-                     command=self._bend_center).pack(pady=(6, 0))
-
-        # XZ plane
-        tk.Label(hz_col, text="XZ Plane", font=FONT_LABEL,
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(pady=(10, 0))
-
-        self._bend_xz_val = tk.IntVar(value=0)
-        self._bend_xz_slider = tk.Scale(
-            hz_col, from_=-100, to=100, orient="horizontal",
-            variable=self._bend_xz_val, showvalue=True, length=180,
-            bg=BG_PANEL, fg=TEXT_PRIMARY, troughcolor=BG_PRIMARY,
-            highlightthickness=0, activebackground=ACCENT_CYAN,
-            command=self._on_bend_xz_slide,
-        )
-        self._bend_xz_slider.pack(pady=5)
-        self._bend_xz_slider.bind("<ButtonRelease-1>", self._on_bend_xz_release)
-
-        row_xz = tk.Frame(hz_col, bg=BG_PANEL)
-        row_xz.pack()
-        tk.Label(row_xz, text="L", font=FONT_LABEL, fg=TEXT_SECONDARY,
-                 bg=BG_PANEL).pack(side="left", padx=(0, 60))
-        tk.Label(row_xz, text="R", font=FONT_LABEL, fg=TEXT_SECONDARY,
-                 bg=BG_PANEL).pack(side="left")
-
-        AccentButton(hz_col, text="Center", width=8,
-                     command=self._bend_xz_center).pack(pady=(6, 0))
+        AccentButton(bend_box, text="Save", accent=ACCENT_GREEN,
+                     command=self._on_save_servos).pack(
+                         fill="x", pady=(4, 0))
 
         # Emergency stop (built once, at panel construction)
         EmergencyStopButton(self, command=self._on_emergency_stop).pack(
             fill="x", padx=10, pady=(5, 10))
 
-    def _on_bend_slide(self, value):
-        # Live update while dragging
-        self._on_send(f"BEND,{int(float(value))}")
+    def _nudge_servo(self, servo_id, delta):
+        var = self._servo_vars[servo_id - 1]
+        new_val = max(-360, min(360, var.get() + delta))
+        var.set(new_val)
+        self._on_send(f"SERVO,{servo_id},{new_val}")
 
-    def _on_bend_release(self, _evt):
-        self._on_send(f"BEND,{int(self._bend_val.get())}")
-
-    def _bend_center(self):
-        self._bend_val.set(0)
-        self._on_send("BEND,0")
-
-    def _on_bend_xz_slide(self, value):
-        self._on_send(f"BEND_XZ,{int(float(value))}")
-
-    def _on_bend_xz_release(self, _evt):
-        self._on_send(f"BEND_XZ,{int(self._bend_xz_val.get())}")
-
-    def _bend_xz_center(self):
-        self._bend_xz_val.set(0)
-        self._on_send("BEND_XZ,0")
-
-    def _on_bend_all_slide(self, value):
-        self._on_send(f"BEND_ALL,{int(float(value))}")
-
-    def _on_bend_all_release(self, _evt):
-        self._on_send(f"BEND_ALL,{int(self._bend_all_val.get())}")
-
-    def _bend_all_center(self):
-        self._bend_all_val.set(0)
-        self._on_send("BEND_ALL,0")
+    def _on_save_servos(self):
+        a, b, c, d = (v.get() for v in self._servo_vars)
+        self._on_send(f"SERVOS,{a},{b},{c},{d}")
 
     def _rebuild_modules(self):
         """Rebuild inflate/deflate rows for all modules."""

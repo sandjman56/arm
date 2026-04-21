@@ -38,6 +38,14 @@ class ArmUI:
         self.running = True
         self.logger = CSVLogger()
 
+        # Experiments-mode auto-logging: Reach starts a log, and it auto-stops
+        # on E-stop, connection loss, or when the controller reaches the
+        # target. Only tracks logs WE started, so a manual log is never
+        # clobbered.
+        self._exp_auto_logging = False
+        self._exp_prev_state = None
+        self._exp_prev_connected = False
+
         self.status = tk.StringVar(value="SELECT PORT AND CONNECT")
         self.connection = tk.StringVar(value="Not connected")
         self.port_var = tk.StringVar()
@@ -79,9 +87,9 @@ class ArmUI:
             ("Module 1", 3, 4),
             ("Module 2", 8, 7),
             ("Module 3", 30, 28),
-            ("Module 4", None, None),
-            ("Module 5", None, None),
-            ("Module 6", None, None),
+            ("Module 4", 34, 32),
+            ("Module 5", 36, 38),
+            ("Module 6", 42, 40),
         ]
         for name, step_pin, dir_pin in MODULE_CONFIG:
             self._add_module_data(name, step_pin=step_pin, dir_pin=dir_pin)
@@ -311,12 +319,11 @@ class ArmUI:
         )
 
         # Experiments mode: backend + controller + panel.
-        from length_calibration import load_or_default
+        from length_calibration import LengthCalibration
         from experiment_backend import SimBackend
         from experiment_controller import ExperimentController
 
-        self.length_cal_path = os.path.join(os.path.dirname(__file__) or ".", "length_calibration.json")
-        self.length_cal = load_or_default(self.length_cal_path)
+        self.length_cal = LengthCalibration(is_default=True)
         # Start with a SimBackend; _refresh_experiment_backend() swaps to
         # LiveBackend whenever serial is connected.
         self.experiment_backend = SimBackend(
@@ -330,7 +337,6 @@ class ArmUI:
             on_start_zero=self._exp_start_zero,
             on_confirm_zero=self._exp_confirm_zero,
             on_rezero=self._exp_rezero,
-            on_recalibrate_length=self._exp_recalibrate_length,
             on_reach=self._exp_reach,
             on_emergency_stop=self._exp_emergency_stop,
         )
@@ -520,46 +526,38 @@ class ArmUI:
         else:
             self.experiment_panel.set_status("Re-zero blocked — pressures not near rest")
 
-    def _exp_recalibrate_length(self):
-        if not (self.arduino.ser and self.arduino.ser.is_open):
-            self.experiment_panel.set_status("Recalibrate needs a serial connection")
-            return
-        from panels.experiment_calibration import run_length_calibration_dialog
-        live_modules = [
-            mid for mid, psi in self.experiment_backend.read_state().module_pressures_psi.items()
-            if isinstance(psi, (int, float))
-        ]
-        cal = run_length_calibration_dialog(
-            root=self.root,
-            available_modules=live_modules or [m["id"] for m in self.modules],
-            command_pressure=lambda mid, psi: self.experiment_backend.set_module_pressure(mid, psi),
-            wait_for_steady=lambda: self.root.after(1500),
-        )
-        if cal is not None:
-            cal.save(self.length_cal_path)
-            self.length_cal = cal
-            self.experiment_controller.cal = cal
-            self.experiment_panel.set_workspace(
-                r_max=cal.L_max, L_rest=cal.L_rest, L_max=cal.L_max,
-                theta_max_rad=1.0472,
-            )
-            self.experiment_panel.set_status("Length calibration saved")
-
     def _exp_reach(self, target_display):
         # Translate target from display frame (zero-relative) to physics frame
         # (base-relative). Display frame origin = (0, 0, L_rest).
         tx, ty, tz = target_display
         target_physics = (tx, ty, tz + self.length_cal.L_rest)
+        # Latch the servo defaults from the burst panel's current slider state
+        # so the bend controller composes its offsets on top of known angles,
+        # never a stale/random read.
         try:
-            self.experiment_controller.reach(target_physics)
+            servo_defaults = {
+                sid: int(self.burst_panel._servo_vars[sid - 1].get())
+                for sid in (1, 2, 3, 4)
+            }
+        except (AttributeError, IndexError):
+            servo_defaults = None
+        try:
+            self.experiment_controller.reach(target_physics, servo_defaults=servo_defaults)
             self.experiment_panel.set_status(f"Reaching toward {target_display}")
             self.experiment_panel.set_target_marker(target_physics)
         except ValueError as e:
             self.experiment_panel.set_status(f"Rejected: {e}")
+            return
+        if not self.logger.is_active:
+            self.start_log()
+            self._exp_auto_logging = True
+        self._exp_prev_state = self.experiment_controller.state
+        self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
 
     def _exp_emergency_stop(self):
         self.experiment_controller.emergency_stop()
         self.experiment_panel.set_status("EMERGENCY STOP")
+        self._exp_auto_log_stop()
 
     def _yaw_drift_deg_per_min(self, current_yaw_rad: float) -> float:
         """Estimate yaw drift over the last ~60s as degrees per minute."""
@@ -918,6 +916,22 @@ class ArmUI:
             # Keep the main loop alive even if the experiment panel breaks.
             print(f"[WARN] experiment tick failed: {e}")
 
+        # Auto-stop experiment logging on (1) controller reached target,
+        # (2) controller timed out, or (3) connection dropped mid-run.
+        if self._exp_auto_logging:
+            from experiment_controller import State as _ExpState
+            cur_state = self.experiment_controller.state
+            cur_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
+            reached = (
+                self._exp_prev_state not in (_ExpState.REACHED, _ExpState.TIMED_OUT)
+                and cur_state in (_ExpState.REACHED, _ExpState.TIMED_OUT)
+            )
+            conn_dropped = self._exp_prev_connected and not cur_connected
+            if reached or conn_dropped:
+                self._exp_auto_log_stop()
+            self._exp_prev_state = cur_state
+            self._exp_prev_connected = cur_connected
+
         self.root.after(100, self.update_loop)
 
     # ===========================
@@ -931,6 +945,14 @@ class ArmUI:
     def stop_log(self):
         self.logger.stop()
         self.status.set("LOGGING STOPPED")
+        self._exp_auto_logging = False
+
+    def _exp_auto_log_stop(self):
+        """Stop logging only if we auto-started it for a reach."""
+        if self._exp_auto_logging and self.logger.is_active:
+            self.logger.stop()
+            self.status.set("LOGGING STOPPED")
+        self._exp_auto_logging = False
 
     # ===========================
     # CLOSE
