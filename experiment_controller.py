@@ -67,6 +67,12 @@ class ExperimentController:
     # independent of speed_scale. Bounds worst-case motion if the UI ever
     # sends a pathological speed value.
     BASIC_RETRACT_MAX_STEP_DEG = 3.0
+    # After the elongation target is hit in basic mode, linger in REACHED for
+    # this many seconds before beginning RETRACTING. Purpose: make the target-
+    # reach moment visible as distinct rows in the CSV phase column and as a
+    # clear visual indicator in the UI. The firmware holds its last commanded
+    # position during the hold (no servo/pressure rewrites).
+    BASIC_REACHED_HOLD_S = 0.5
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -98,6 +104,7 @@ class ExperimentController:
         self._basic_slack_deg: float = 0.0
         self._basic_elongation_mm: float = 0.0
         self._basic_retract_elapsed_s: float = 0.0
+        self._basic_reached_hold_elapsed_s: float = 0.0
 
     # --- Transitions -------------------------------------------------------
 
@@ -272,6 +279,12 @@ class ExperimentController:
                 self._tick_elongating()
         elif self.state == State.RETRACTING:
             self._tick_basic_retracting(dt)
+        elif (
+            self.state == State.REACHED
+            and self.mode == ExperimentMode.BASIC_ELONGATION
+            and self._basic_reached_hold_elapsed_s < self.BASIC_REACHED_HOLD_S
+        ):
+            self._tick_basic_reached_hold(dt)
         elif self.state == State.BENDING:
             self._tick_bending()
 
@@ -344,15 +357,35 @@ class ExperimentController:
             math.radians(-self._basic_slack_deg) * self.PULLEY_RADIUS_MM
         )
         if self._basic_elongation_mm >= self._basic_z_target_mm:
-            # Do not freeze pressures - reverse phase will drop them toward
-            # baseline while servos wind back to their start angles.
-            self._phase_start = time.monotonic()
-            self._basic_retract_elapsed_s = 0.0
-            self.state = State.RETRACTING
+            # Tag the target-reach moment with REACHED so it's visible in
+            # CSV phase rows + UI before RETRACTING begins. Result is
+            # latched here (elongation-phase elapsed, no pose error in
+            # basic mode). The REACHED hold runs for BASIC_REACHED_HOLD_S;
+            # RETRACTING takes over in _tick_basic_reached_hold.
+            elapsed = time.monotonic() - self._phase_start
+            self._last_result = RunResult(
+                final_pitch_err_rad=0.0,
+                final_position_err_mm=0.0,
+                elapsed_s=elapsed,
+                timed_out=False,
+            )
+            self._basic_reached_hold_elapsed_s = 0.0
+            self.state = State.REACHED
 
     def basic_elongation_mm(self) -> float:
         """Current integrated elongation in mm (Basic mode only)."""
         return self._basic_elongation_mm
+
+    def _tick_basic_reached_hold(self, dt: float) -> None:
+        """Count down the brief REACHED hold after basic-mode target-reach,
+        then begin RETRACTING. Pressures and servos are not rewritten here
+        (REACHED carries the no-SERVO-writes convention); the firmware holds
+        the last commanded position."""
+        self._basic_reached_hold_elapsed_s += dt
+        if self._basic_reached_hold_elapsed_s >= self.BASIC_REACHED_HOLD_S:
+            self._phase_start = time.monotonic()
+            self._basic_retract_elapsed_s = 0.0
+            self.state = State.RETRACTING
 
     def _tick_basic_retracting(self, dt: float) -> None:
         """Reverse the basic-mode motion: wind servos back up at the set rate

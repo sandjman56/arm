@@ -25,13 +25,16 @@ class CSVLogger:
         "s1", "s2", "s3", "s4",
         "pitch_deg", "roll_deg", "yaw_deg",
         "phase",
+        "slack_deg", "p_sum_delta_psi",
     ]
 
-    def start(self):
-        """Start logging. Returns the filename."""
+    def start(self, prefix="log"):
+        """Start logging. Returns the filename. `prefix` is prepended to the
+        timestamped filename so specialty runs (e.g. `length_test`) are easy
+        to spot alongside normal `log_*` runs."""
         if self._active:
             return None
-        name = datetime.now().strftime("log_%Y%m%d_%H%M%S.csv")
+        name = datetime.now().strftime(f"{prefix}_%Y%m%d_%H%M%S.csv")
         path = os.path.join(self.output_dir, name)
         self._file = open(path, "w", newline="")
         self._writer = csv.writer(self._file)

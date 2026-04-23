@@ -345,12 +345,15 @@ def test_basic_full_run_reaches_then_retracts_then_reached(ctrl):
         z_target_mm=3.0, psi_threshold=15.0,
         pressure_ceiling_psi=20.0, speed_scale=2.0,
     )
+    # Basic mode now tags target-reach with a brief REACHED hold before
+    # RETRACTING, so break only on the post-retract REACHED (after we've
+    # also seen RETRACTING).
     saw_retracting = False
     for _ in range(500):
         ctrl.tick(dt=0.05)
         if ctrl.state == State.RETRACTING:
             saw_retracting = True
-        if ctrl.state == State.REACHED:
+        if saw_retracting and ctrl.state == State.REACHED:
             break
     assert saw_retracting
     assert ctrl.state == State.REACHED

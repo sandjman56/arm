@@ -360,13 +360,20 @@ class ExperimentPanel(tk.Frame):
             f"pitch {_m.degrees(pitch):.1f}°  roll {_m.degrees(roll):.1f}°  yaw {_m.degrees(yaw):.1f}°"
         )
         self.yaw_drift_var.set(f"Yaw drift: {yaw_drift_deg_per_min:.2f}°/min")
-        self.phase_var.set(f"Phase: {phase}")
-        self.error_var.set(error_text)
-        # REACHED visuals: green phase label + green target dots across all
-        # three canvases. Red everywhere else.
         reached = (phase == "REACHED")
+        # Swap the phase line to a loud "TARGET REACHED" banner on reach so
+        # it's impossible to miss; revert to the plain phase readout otherwise.
+        self.phase_var.set("TARGET REACHED" if reached else f"Phase: {phase}")
+        self.error_var.set(error_text)
         if self._phase_label is not None:
-            self._phase_label.configure(fg=ACCENT_GREEN if reached else TEXT_PRIMARY)
+            if reached:
+                self._phase_label.configure(
+                    fg=BG_PANEL, bg=ACCENT_GREEN, font=FONT_BODY_BOLD,
+                )
+            else:
+                self._phase_label.configure(
+                    fg=TEXT_PRIMARY, bg=BG_PANEL, font=FONT_BODY,
+                )
         self.xy_picker.set_reached(reached)
         self.xz_picker.set_reached(reached)
         self.preview3d.set_reached(reached)

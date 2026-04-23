@@ -1,5 +1,6 @@
 # panels/calibration_panel.py -- Calibration mode panel
 import tkinter as tk
+from tkinter import ttk
 from theme import (
     BG_PANEL, BG_INPUT, ACCENT_CYAN, ACCENT_CYAN_DIM, ACCENT_ORANGE, ACCENT_GREEN, ACCENT_RED,
     TEXT_PRIMARY, TEXT_SECONDARY,
@@ -9,10 +10,16 @@ from widgets import AccentButton, EmergencyStopButton
 
 
 class CalibrationPanel(tk.Frame):
-    """Calibration panel for setting per-module stepper position limits."""
+    """Calibration panel with two subtabs:
+
+    - Per-Module: stepper endstop calibration (back/front wall limits).
+    - Length: logging helper for pressure→length calibration runs; writes
+      CSVs with the `length_test` prefix so they are easy to isolate.
+    """
 
     def __init__(self, parent, modules, on_send, on_set_back, on_set_front,
-                 on_save, on_clear, on_module_change, on_emergency_stop, **kwargs):
+                 on_save, on_clear, on_module_change, on_emergency_stop,
+                 on_length_test_start=None, on_length_test_stop=None, **kwargs):
         super().__init__(parent, bg=BG_PANEL, **kwargs)
         # modules is a list of module dicts (id, name, color, ...) for wired
         # modules only. The panel renders one radio per module and routes all
@@ -25,11 +32,14 @@ class CalibrationPanel(tk.Frame):
         self._on_clear = on_clear
         self._on_module_change = on_module_change
         self._on_emergency_stop = on_emergency_stop
+        self._on_length_test_start = on_length_test_start
+        self._on_length_test_stop = on_length_test_stop
 
         self.cal_pos_var = tk.StringVar(value="0")
         self.cal_back_var = tk.StringVar(value="NOT SET")
         self.cal_front_var = tk.StringVar(value="NOT SET")
         self.cal_range_var = tk.StringVar(value="---")
+        self.length_status_var = tk.StringVar(value="Idle — press Start Test to begin logging.")
 
         default_id = modules[0]["id"] if modules else 1
         self.selected_module_id = tk.IntVar(value=default_id)
@@ -42,8 +52,25 @@ class CalibrationPanel(tk.Frame):
         tk.Label(self, text="CALIBRATION", font=FONT_BODY_BOLD,
                 fg=ACCENT_CYAN, bg=BG_PANEL).pack(anchor="w", padx=10, pady=(6, 0))
 
+        # Subtab container (Per-Module / Length)
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=10, pady=(6, 0))
+
+        per_module_tab = tk.Frame(notebook, bg=BG_PANEL)
+        length_tab = tk.Frame(notebook, bg=BG_PANEL)
+        notebook.add(per_module_tab, text="Per-Module")
+        notebook.add(length_tab, text="Length")
+
+        self._build_per_module_tab(per_module_tab)
+        self._build_length_tab(length_tab)
+
+        # Emergency stop (shared across subtabs)
+        EmergencyStopButton(self, command=self._on_emergency_stop).pack(
+            fill="x", padx=10, pady=(10, 10))
+
+    def _build_per_module_tab(self, parent):
         # Module selector
-        sel_frame = tk.Frame(self, bg=BG_PANEL)
+        sel_frame = tk.Frame(parent, bg=BG_PANEL)
         sel_frame.pack(fill="x", padx=15, pady=(6, 0))
         tk.Label(sel_frame, text="MODULE:", font=FONT_LABEL,
                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
@@ -57,7 +84,7 @@ class CalibrationPanel(tk.Frame):
             ).pack(side="left", padx=(10, 0))
 
         # Current position display
-        pos_frame = tk.Frame(self, bg=BG_PANEL)
+        pos_frame = tk.Frame(parent, bg=BG_PANEL)
         pos_frame.pack(fill="x", padx=15, pady=8)
 
         tk.Label(pos_frame, text="CURRENT POSITION:", font=FONT_BODY,
@@ -73,15 +100,15 @@ class CalibrationPanel(tk.Frame):
                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=5)
 
         # Step 1: Back wall
-        self._build_wall_section("STEP 1: SET BACK WALL",
+        self._build_wall_section(parent, "STEP 1: SET BACK WALL",
                                  self._handle_set_back, self.cal_back_var, "back")
 
         # Step 2: Front wall
-        self._build_wall_section("STEP 2: SET FRONT WALL",
+        self._build_wall_section(parent, "STEP 2: SET FRONT WALL",
                                  self._handle_set_front, self.cal_front_var, "front")
 
         # Results & save
-        result_frame = tk.Frame(self, bg=BG_PANEL)
+        result_frame = tk.Frame(parent, bg=BG_PANEL)
         result_frame.pack(fill="x", padx=15, pady=8)
 
         tk.Label(result_frame, text="RANGE:", font=FONT_BODY,
@@ -99,13 +126,43 @@ class CalibrationPanel(tk.Frame):
                     accent=ACCENT_RED, font=FONT_BUTTON,
                     command=self._handle_clear).pack(side="left", padx=10)
 
-        # Emergency stop
-        EmergencyStopButton(self, command=self._on_emergency_stop).pack(
-            fill="x", padx=10, pady=(10, 10))
+    def _build_length_tab(self, parent):
+        tk.Label(parent, text="LENGTH CALIBRATION LOGGER", font=FONT_BODY_BOLD,
+                fg=ACCENT_CYAN, bg=BG_PANEL).pack(anchor="w", padx=15, pady=(10, 0))
 
-    def _build_wall_section(self, title, on_set, status_var, wall_type):
+        instructions = (
+            "Press Start Test to begin recording a CSV to the logger/ folder with the "
+            "'length_test' prefix. Drive the arm however you like during the run, then "
+            "press Stop Test when finished. Note the total arm length at start and end "
+            "for post-hoc analysis."
+        )
+        tk.Label(parent, text=instructions, font=FONT_BODY,
+                fg=TEXT_SECONDARY, bg=BG_PANEL, wraplength=540, justify="left"
+        ).pack(anchor="w", padx=15, pady=(4, 10))
+
+        btn_row = tk.Frame(parent, bg=BG_PANEL)
+        btn_row.pack(fill="x", padx=15, pady=(0, 8))
+
+        self._length_start_btn = AccentButton(
+            btn_row, text="Start Test", accent=ACCENT_GREEN,
+            font=FONT_BUTTON_LARGE, command=self._handle_length_test_start,
+        )
+        self._length_start_btn.pack(side="left")
+
+        self._length_stop_btn = AccentButton(
+            btn_row, text="Stop Test", accent=ACCENT_RED,
+            font=FONT_BUTTON_LARGE, command=self._handle_length_test_stop,
+        )
+        self._length_stop_btn.pack(side="left", padx=10)
+        self._length_stop_btn.set_state(False)
+
+        tk.Label(parent, textvariable=self.length_status_var, font=FONT_BODY,
+                fg=ACCENT_ORANGE, bg=BG_PANEL, wraplength=540, justify="left"
+        ).pack(anchor="w", padx=15, pady=(0, 10))
+
+    def _build_wall_section(self, parent, title, on_set, status_var, wall_type):
         """Build a back/front wall calibration section."""
-        section = tk.Frame(self, bg=BG_PANEL)
+        section = tk.Frame(parent, bg=BG_PANEL)
         section.pack(fill="x", padx=15, pady=4)
 
         tk.Frame(section, bg=ACCENT_CYAN_DIM, height=1).pack(fill="x")
@@ -144,6 +201,26 @@ class CalibrationPanel(tk.Frame):
 
     def _handle_module_change(self):
         self._on_module_change(self.selected_module_id.get())
+
+    def _handle_length_test_start(self):
+        if self._on_length_test_start is None:
+            self.length_status_var.set("No logger callback wired — check app setup.")
+            return
+        self._on_length_test_start()
+
+    def _handle_length_test_stop(self):
+        if self._on_length_test_stop is None:
+            return
+        self._on_length_test_stop()
+
+    def set_length_test_active(self, active, filename=None):
+        """Update UI to reflect whether a length-test log is currently running."""
+        self._length_start_btn.set_state(not active)
+        self._length_stop_btn.set_state(active)
+        if active:
+            self.length_status_var.set(f"Recording → {filename or 'logger/length_test_*.csv'}")
+        else:
+            self.length_status_var.set("Idle — press Start Test to begin logging.")
 
     def set_position(self, module_id, steps):
         """Update position display if module_id is the currently selected one."""
