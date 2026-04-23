@@ -46,6 +46,41 @@ def test_confirm_zero_without_servo_defaults_leaves_them_none(ctrl):
     assert ctrl._servo_defaults is None
 
 
+def test_reach_basic_requires_waiting_state(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    with pytest.raises(ValueError):
+        ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0)
+
+
+def test_reach_basic_requires_basic_mode(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    with pytest.raises(ValueError):
+        ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0)
+
+
+def test_reach_basic_requires_servo_defaults(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    with pytest.raises(ValueError):
+        ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0)
+
+
+def test_reach_basic_transitions_to_elongating(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0)
+    assert ctrl.state == State.ELONGATING
+    assert ctrl._basic_z_target_mm == 30.0
+    assert ctrl._basic_psi_threshold == 15.0
+    assert ctrl._basic_slack_deg == 0.0
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING

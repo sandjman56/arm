@@ -176,6 +176,39 @@ class ExperimentController:
             self.backend.set_total_length_target(L_target)
         self.state = State.ELONGATING
 
+    def reach_basic(
+        self,
+        z_target_mm: float,
+        psi_threshold: float,
+        pressure_ceiling_psi: Optional[float] = None,
+    ) -> None:
+        """Begin a Basic Elongation run.
+
+        Steppers keep inflating; the 4 tendon servos share a common-mode
+        unwind driven by a P-controller on max-balloon-psi vs. threshold.
+        Elongation is integrated from slack angle x pulley radius. Reach
+        declared when elongation >= z_target_mm.
+        """
+        if self.mode != ExperimentMode.BASIC_ELONGATION:
+            raise ValueError("reach_basic requires BASIC_ELONGATION mode")
+        if self.state not in (State.WAITING_FOR_TARGET, State.REACHED, State.TIMED_OUT):
+            raise ValueError(
+                f"not ready to Reach (state={self.state.value}). "
+                "Press Zero @ Rest -> Confirm Zero first."
+            )
+        if self._servo_defaults is None:
+            raise ValueError(
+                "servo defaults not latched - press Confirm Zero with servo angles first"
+            )
+        self._basic_z_target_mm = float(z_target_mm)
+        self._basic_psi_threshold = float(psi_threshold)
+        self._basic_slack_deg = 0.0
+        self._basic_elongation_mm = 0.0
+        self._pressure_ceiling_psi = pressure_ceiling_psi
+        # Flat per-module setpoint (Task 7 adds the actual commands).
+        self._phase_start = time.monotonic()
+        self.state = State.ELONGATING
+
     # --- Main tick ---------------------------------------------------------
 
     _ACTIVE_STATES = frozenset({State.ELONGATING, State.BENDING, State.REACHED})
