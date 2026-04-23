@@ -188,13 +188,14 @@ Adafruit_MPRLS mpr = Adafruit_MPRLS();
 #define MAX_MODULES 6
 
 // Pressure sensor channel mapping (via PCA9548A mux)
-#define NUM_PRESSURE_SENSORS 5
-uint8_t pressureChannels[MAX_MODULES] = {3, 0, 1, 4, 5};
-// index 0 -> Module 1 on ch 1 (SD1/SC1)
+#define NUM_PRESSURE_SENSORS 6
+uint8_t pressureChannels[MAX_MODULES] = {3, 0, 1, 4, 5, 6};
+// index 0 -> Module 1 on ch 3 (SD3/SC3)
 // index 1 -> Module 2 on ch 0 (SD0/SC0)
-// index 2 -> Module 3 on ch 3 (SD3/SC3)
+// index 2 -> Module 3 on ch 1 (SD1/SC1)
 // index 3 -> Module 4 on ch 4 (SD4/SC4)
 // index 4 -> Module 5 on ch 5 (SD5/SC5)
+// index 5 -> Module 6 on ch 6 (SD6/SC6)
 bool    pressurePresent[MAX_MODULES]  = {false};
 
 struct Module {
@@ -224,7 +225,7 @@ const int BURST_STEPS = 40;
 // stepper doesn't hunt/overshoot on the ~0.1 psi pneumatic noise floor. 5 hPa
 // ≈ 0.07 psi.
 const float PID_DEADBAND_HPA = 5.0;
-const int STEP_DELAY_US = 2000;
+const int STEP_DELAY_US = 1000;
 
 // =========================
 // Serial buffer
@@ -332,7 +333,7 @@ void setup() {
   initModule(4, 36, 38);
   initModule(5, 42, 40);
   modules[4].dirInvert = true;  // M5 motor wired backwards
-  modules[5].dirInvert = true;  // M6 motor wired backwards
+  modules[5].dirInvert = true;   // M6 motor wired backwards (inflates inverted)
   moduleCount = 6;
 
   // Attach bend servos on boot and drive to startup defaults so the arm
