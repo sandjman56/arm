@@ -599,7 +599,7 @@ class ArmUI:
             self.experiment_panel.set_status(f"Rejected: {e}")
             return
         if not self.logger.is_active:
-            self.start_log()
+            self.start_log(prefix="Complex")
             self._exp_auto_logging = True
         self._exp_prev_state = self.experiment_controller.state
         self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
@@ -633,7 +633,7 @@ class ArmUI:
             self.experiment_panel.set_status(f"Rejected: {e}")
             return
         if not self.logger.is_active:
-            self.start_log()
+            self.start_log(prefix=f"Elong_{int(round(z_target_mm))}mm")
             self._exp_auto_logging = True
         self._exp_prev_state = self.experiment_controller.state
         self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
@@ -1077,8 +1077,8 @@ class ArmUI:
     # ===========================
     # LOGGING
     # ===========================
-    def start_log(self):
-        name = self.logger.start()
+    def start_log(self, prefix=None):
+        name = self.logger.start(prefix=prefix) if prefix else self.logger.start()
         if name:
             self.status.set(f"LOGGING: {name}")
 
