@@ -16,6 +16,7 @@ class State(enum.Enum):
     WAITING_FOR_TARGET = "WAITING_FOR_TARGET"
     ELONGATING = "ELONGATING"
     BENDING = "BENDING"
+    RETRACTING = "RETRACTING"
     REACHED = "REACHED"
     TIMED_OUT = "TIMED_OUT"
 
@@ -260,6 +261,8 @@ class ExperimentController:
             else:
                 self._advance_inflation_ramp(dt)
                 self._tick_elongating()
+        elif self.state == State.RETRACTING:
+            self._tick_basic_retracting(dt)
         elif self.state == State.BENDING:
             self._tick_bending()
 
@@ -328,7 +331,43 @@ class ExperimentController:
             math.radians(-self._basic_slack_deg) * self.PULLEY_RADIUS_MM
         )
         if self._basic_elongation_mm >= self._basic_z_target_mm:
-            self._hold_pressures_at_current()
+            # Do not freeze pressures - reverse phase will drop them toward
+            # baseline while servos wind back to their start angles.
+            self._phase_start = time.monotonic()
+            self.state = State.RETRACTING
+
+    def basic_elongation_mm(self) -> float:
+        """Current integrated elongation in mm (Basic mode only)."""
+        return self._basic_elongation_mm
+
+    def _tick_basic_retracting(self, dt: float) -> None:
+        """Reverse the basic-mode motion: wind servos back up at the set rate
+        while modules deflate toward baseline. Terminal state is REACHED
+        (baseline)."""
+        # Constant wind rate (positive = winding toward default angle).
+        rate = self.BASIC_UNWIND_MAX_DEG_PER_S * self._basic_speed_scale
+        self._basic_slack_deg = min(0.0, self._basic_slack_deg + rate * dt)
+        # Write composed tendon angles.
+        if self._servo_defaults is not None:
+            for sid in (1, 2, 3, 4):
+                default = self._servo_defaults.get(sid, 0.0)
+                angle = default + self._basic_slack_deg
+                self.last_tendon_angles[sid] = angle
+                self.backend.set_tendon_angle(sid, angle)
+        # Drive module pressures back toward their zero-capture baseline. The
+        # firmware PID deflates at its natural rate to match.
+        baseline = self._psi_baseline or {}
+        for mid in range(1, 7):
+            if mid in self.EXCLUDED_MODULES:
+                continue
+            target = baseline.get(mid, 0.0)
+            self._pressure_setpoints[mid] = target
+            self.backend.set_module_pressure(mid, target)
+        # Elongation tracks the (shrinking) slack magnitude.
+        self._basic_elongation_mm = (
+            math.radians(-self._basic_slack_deg) * self.PULLEY_RADIUS_MM
+        )
+        if self._basic_slack_deg >= 0.0:
             elapsed = time.monotonic() - self._phase_start
             self._last_result = RunResult(
                 final_pitch_err_rad=0.0,
@@ -337,10 +376,6 @@ class ExperimentController:
                 timed_out=False,
             )
             self.state = State.REACHED
-
-    def basic_elongation_mm(self) -> float:
-        """Current integrated elongation in mm (Basic mode only)."""
-        return self._basic_elongation_mm
 
     def _finish(self, timed_out: bool) -> None:
         elapsed = time.monotonic() - self._phase_start

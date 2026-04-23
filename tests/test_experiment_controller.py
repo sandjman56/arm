@@ -160,13 +160,15 @@ def test_basic_reaches_when_elongation_hits_target(ctrl):
     z_target = 5.0
     ctrl.reach_basic(z_target_mm=z_target, psi_threshold=15.0)
     ctrl.backend._pressures[1] = 25.0  # overshoot -> clamped 30 deg/s
-    # ~13 mm/s -> ~0.4s to hit 5mm
-    for _ in range(40):
+    peak_elongation = 0.0
+    for _ in range(200):
         ctrl.tick(dt=0.05)
+        peak_elongation = max(peak_elongation, ctrl._basic_elongation_mm)
         if ctrl.state == State.REACHED:
             break
+    # After retraction completes, state = REACHED; peak elongation hit the target.
     assert ctrl.state == State.REACHED
-    assert ctrl._basic_elongation_mm >= z_target
+    assert peak_elongation >= z_target
 
 
 def test_basic_no_bending_state_ever_reached(ctrl):
@@ -243,6 +245,96 @@ def test_basic_reach_rejects_nonpositive_speed_scale(ctrl):
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
     with pytest.raises(ValueError):
         ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0, speed_scale=0.0)
+
+
+def test_basic_target_reached_transitions_to_retracting(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=3.0, psi_threshold=15.0, pressure_ceiling_psi=20.0)
+    for _ in range(100):
+        ctrl.tick(dt=0.05)
+        if ctrl.state == State.RETRACTING:
+            break
+    assert ctrl.state == State.RETRACTING
+    assert ctrl._basic_elongation_mm >= 3.0
+
+
+def test_basic_retracting_winds_slack_back_up_at_set_rate(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=1.0)
+    # Force into RETRACTING with a known starting slack.
+    ctrl._basic_slack_deg = -20.0
+    ctrl.state = State.RETRACTING
+    ctrl.tick(dt=0.1)
+    # rate = 30 deg/s * 1.0 * 0.1s = 3.0 deg
+    assert ctrl._basic_slack_deg == pytest.approx(-17.0, abs=1e-6)
+
+
+def test_basic_retracting_honors_speed_scale(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=2.0)
+    ctrl._basic_slack_deg = -20.0
+    ctrl.state = State.RETRACTING
+    ctrl.tick(dt=0.1)
+    # rate = 30 * 2.0 * 0.1 = 6.0 deg
+    assert ctrl._basic_slack_deg == pytest.approx(-14.0, abs=1e-6)
+
+
+def test_basic_retracting_clamps_slack_at_zero(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0)
+    ctrl._basic_slack_deg = -1.0
+    ctrl.state = State.RETRACTING
+    ctrl.tick(dt=1.0)  # plenty of time to overshoot
+    assert ctrl._basic_slack_deg == 0.0
+    assert ctrl.state == State.REACHED
+
+
+def test_basic_retracting_commands_deflation_to_baseline(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    # Make the baseline nontrivial so we can verify it's used as the target.
+    ctrl._psi_baseline = {mid: 0.5 for mid in range(1, 7)}
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, pressure_ceiling_psi=20.0)
+    ctrl._basic_slack_deg = -10.0
+    ctrl.state = State.RETRACTING
+    ctrl.tick(dt=0.1)
+    for mid in range(1, 7):
+        assert ctrl.backend._pressures[mid] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_basic_full_run_reaches_then_retracts_then_reached(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(
+        z_target_mm=3.0, psi_threshold=15.0,
+        pressure_ceiling_psi=20.0, speed_scale=2.0,
+    )
+    saw_retracting = False
+    for _ in range(500):
+        ctrl.tick(dt=0.05)
+        if ctrl.state == State.RETRACTING:
+            saw_retracting = True
+        if ctrl.state == State.REACHED:
+            break
+    assert saw_retracting
+    assert ctrl.state == State.REACHED
+    assert ctrl._basic_slack_deg == 0.0
 
 
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
