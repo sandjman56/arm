@@ -527,6 +527,13 @@ class ArmUI:
         self.experiment_panel.set_status("Zeroing — confirm trunk is at rest, then Confirm Zero")
 
     def _exp_confirm_zero(self):
+        # Sync controller mode to whatever the UI sub-mode shows, so the
+        # Complex-mode angle-control tick doesn't run in a Basic session.
+        from experiment_controller import ExperimentMode
+        if self.experiment_panel.current_submode() == "BASIC":
+            self.experiment_controller.mode = ExperimentMode.BASIC_ELONGATION
+        else:
+            self.experiment_controller.mode = ExperimentMode.COMPLEX
         # Snapshot whatever the burst-panel sliders currently show. Both
         # sub-modes latch the captured angles as the controller's
         # _servo_defaults — Confirm Zero must never move the servos, or

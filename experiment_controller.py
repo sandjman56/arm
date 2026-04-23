@@ -269,8 +269,12 @@ class ExperimentController:
         # Complex-mode angle-control path. Basic mode writes its own angles in
         # _tick_basic_elongating() and must not double-write via
         # _update_tendon_angles(), which uses Complex-mode slack/bend formulas.
+        # Also skipped while waiting/idle - nothing is moving, so there's no
+        # reason to spam SERVO commands at the firmware (continuous-rotation
+        # servos drift under repeated non-center commands).
         if (
             self.mode == ExperimentMode.COMPLEX
+            and self.state in (State.ELONGATING, State.BENDING)
             and self._servo_defaults is not None
             and self._psi_baseline is not None
         ):
