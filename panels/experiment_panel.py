@@ -42,6 +42,7 @@ class ExperimentPanel(tk.Frame):
         on_confirm_zero,
         on_rezero,
         on_reach,
+        on_reach_basic,
         on_emergency_stop,
         **kwargs,
     ):
@@ -50,6 +51,7 @@ class ExperimentPanel(tk.Frame):
         self._on_confirm_zero = on_confirm_zero
         self._on_rezero = on_rezero
         self._on_reach = on_reach
+        self._on_reach_basic = on_reach_basic
         self._on_emergency_stop = on_emergency_stop
 
         # StringVars so the update loop can push values in.
@@ -65,6 +67,14 @@ class ExperimentPanel(tk.Frame):
         self.target_x = tk.StringVar(value="")
         self.target_y = tk.StringVar(value="")
         self.target_z = tk.StringVar(value="")
+
+        # Basic sub-mode state.
+        self.submode_var = tk.StringVar(value="BASIC")
+        self.basic_z_var = tk.StringVar(value="20.0")
+        self.basic_threshold_var = tk.StringVar(value="15.0")
+        self.basic_elongation_readout_var = tk.StringVar(value="Elongation: 0.0 / 0.0 mm")
+        self.basic_slack_readout_var = tk.StringVar(value="Slack: 0.0 deg")
+        self.basic_maxpsi_readout_var = tk.StringVar(value="Max psi: 0.0")
 
         # Current workspace for coordinate-frame conversions when updating the
         # 3D preview (physics-frame). Kept in sync by set_workspace().
@@ -91,6 +101,24 @@ class ExperimentPanel(tk.Frame):
         tk.Label(self, text="EXPERIMENTS", font=FONT_BODY_BOLD,
                  fg=ACCENT_CYAN, bg=BG_PANEL).pack(anchor="w", padx=10, pady=(6, 0),
                                                    side="top")
+
+        # Sub-mode selector: Basic (scalar Z, no IMU) vs Complex (XYZ + bending).
+        mode_row = tk.Frame(self, bg=BG_PANEL)
+        mode_row.pack(fill="x", padx=10, pady=(4, 0), side="top")
+        tk.Label(mode_row, text="Sub-mode:", font=FONT_LABEL,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Radiobutton(
+            mode_row, text="Basic Elongation", variable=self.submode_var, value="BASIC",
+            command=self._on_submode_change,
+            font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
+            selectcolor=BG_PANEL, activebackground=BG_PANEL,
+        ).pack(side="left", padx=(8, 0))
+        tk.Radiobutton(
+            mode_row, text="Complex", variable=self.submode_var, value="COMPLEX",
+            command=self._on_submode_change,
+            font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
+            selectcolor=BG_PANEL, activebackground=BG_PANEL,
+        ).pack(side="left", padx=(8, 0))
 
         btn_row = tk.Frame(self, bg=BG_PANEL)
         btn_row.pack(fill="x", padx=10, pady=6, side="top")
@@ -126,6 +154,26 @@ class ExperimentPanel(tk.Frame):
             if var is self.phase_var:
                 self._phase_label = lbl
 
+        # Stepper activity indicators: one dot per module, lit when the
+        # firmware is currently stepping (position changing) — i.e. actively
+        # driving pressure up or down.
+        stepper_row = tk.Frame(self, bg=BG_PANEL)
+        stepper_row.pack(fill="x", padx=10, pady=(2, 2), side="bottom")
+        tk.Label(stepper_row, text="Steppers:", font=FONT_LABEL,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        self._stepper_dots: dict = {}
+        for mid in (1, 2, 3, 4, 5, 6):
+            cell = tk.Frame(stepper_row, bg=BG_PANEL)
+            cell.pack(side="left", padx=(8, 0))
+            tk.Label(cell, text=f"M{mid}", font=FONT_LABEL,
+                     fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+            dot = tk.Canvas(cell, width=12, height=12, bg=BG_PANEL,
+                            highlightthickness=0)
+            dot.create_oval(2, 2, 10, 10, fill=BG_PANEL,
+                            outline=TEXT_SECONDARY, tags=("dot",))
+            dot.pack(side="left", padx=(3, 0))
+            self._stepper_dots[mid] = dot
+
         tgt_row = tk.Frame(self, bg=BG_PANEL)
         tgt_row.pack(fill="x", padx=10, pady=(4, 4), side="bottom")
         tk.Label(tgt_row, text="Target:", font=FONT_BODY,
@@ -138,12 +186,36 @@ class ExperimentPanel(tk.Frame):
         AccentButton(tgt_row, text="Reach", accent=ACCENT_GREEN,
                      command=self._handle_reach).pack(side="left", padx=15)
 
-        # --- 3. Canvas row fills whatever is left (shrinks first) ---------
+        # --- 3a. Basic body frame (shown when sub-mode == BASIC) ----------
+        self.basic_body = tk.Frame(self, bg=BG_PANEL)
+
+        basic_entry = tk.Frame(self.basic_body, bg=BG_PANEL)
+        basic_entry.pack(fill="x", pady=6)
+        tk.Label(basic_entry, text="Z (mm):", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(basic_entry, textvariable=self.basic_z_var, width=8,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
+        tk.Label(basic_entry, text="PSI threshold:", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(basic_entry, textvariable=self.basic_threshold_var, width=6,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
+        AccentButton(basic_entry, text="Reach", accent=ACCENT_GREEN,
+                     command=self._handle_reach_basic).pack(side="left", padx=12)
+
+        basic_readouts = tk.Frame(self.basic_body, bg=BG_PANEL)
+        basic_readouts.pack(fill="x", pady=(4, 2))
+        for var in (self.basic_elongation_readout_var,
+                    self.basic_slack_readout_var,
+                    self.basic_maxpsi_readout_var):
+            tk.Label(basic_readouts, textvariable=var, font=FONT_BODY,
+                     fg=TEXT_PRIMARY, bg=BG_PANEL).pack(anchor="w")
+
+        # --- 3b. Canvas row (Complex mode) fills whatever is left --------
         from panels.experiment_pickers import XYPicker, XZPicker
         from panels.experiment_preview import TrunkPreview3D
 
         self.canvas_row = tk.Frame(self, bg=BG_PANEL)
-        self.canvas_row.pack(fill="both", expand=True, padx=10, pady=4, side="top")
+        # Intentionally NOT packed here; _on_submode_change handles visibility.
         self.xy_picker = XYPicker(self.canvas_row, r_max=400.0)
         self.xy_picker.pack(side="left", padx=4, fill="both", expand=True)
         self.xy_picker.bind_pick(self._on_xy_pick)
@@ -152,6 +224,41 @@ class ExperimentPanel(tk.Frame):
         self.xz_picker.bind_pick(self._on_xz_pick)
         self.preview3d = TrunkPreview3D(self.canvas_row, L_max=480.0)
         self.preview3d.pack(side="left", padx=4, fill="both", expand=True)
+
+        # Default to BASIC: pack basic_body, hide canvas_row.
+        self._on_submode_change()
+
+    # ----------------------------------------------------------------------
+    # Sub-mode / Basic handlers
+    # ----------------------------------------------------------------------
+    def _on_submode_change(self) -> None:
+        """Swap between Basic body frame and Complex canvas row."""
+        if self.submode_var.get() == "BASIC":
+            self.canvas_row.pack_forget()
+            self.basic_body.pack(fill="both", expand=True, padx=10, pady=4, side="top")
+        else:
+            self.basic_body.pack_forget()
+            self.canvas_row.pack(fill="both", expand=True, padx=10, pady=4, side="top")
+
+    def _handle_reach_basic(self) -> None:
+        try:
+            z = float(self.basic_z_var.get())
+            threshold = float(self.basic_threshold_var.get())
+        except ValueError:
+            self.status_var.set("Invalid input - Z and threshold must be numbers")
+            return
+        self._on_reach_basic(z, threshold)
+
+    def set_basic_readouts(self, elongation_mm: float, z_target_mm: float,
+                           slack_deg: float, max_psi: float) -> None:
+        self.basic_elongation_readout_var.set(
+            f"Elongation: {elongation_mm:.1f} / {z_target_mm:.1f} mm"
+        )
+        self.basic_slack_readout_var.set(f"Slack: {slack_deg:.1f} deg")
+        self.basic_maxpsi_readout_var.set(f"Max psi: {max_psi:.1f}")
+
+    def current_submode(self) -> str:
+        return self.submode_var.get()
 
     # ----------------------------------------------------------------------
     # Picker callbacks
@@ -254,6 +361,15 @@ class ExperimentPanel(tk.Frame):
         self.xy_picker.set_reached(reached)
         self.xz_picker.set_reached(reached)
         self.preview3d.set_reached(reached)
+
+    def set_stepper_active(self, module_id: int, active: bool) -> None:
+        """Light/dim the activity dot for one module's stepper."""
+        dot = self._stepper_dots.get(module_id)
+        if dot is None:
+            return
+        fill = ACCENT_GREEN if active else BG_PANEL
+        outline = ACCENT_GREEN if active else TEXT_SECONDARY
+        dot.itemconfigure("dot", fill=fill, outline=outline)
 
     def set_tip_position(self, tip_display: Tuple[float, float, float],
                          arc_points_physics: list) -> None:
