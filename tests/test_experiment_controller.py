@@ -81,6 +81,53 @@ def test_reach_basic_transitions_to_elongating(ctrl):
     assert ctrl._basic_slack_deg == 0.0
 
 
+def test_basic_unwind_zero_when_under_threshold(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0)
+    for _ in range(10):
+        ctrl.tick(dt=0.1)
+    assert ctrl._basic_slack_deg == 0.0
+
+
+def test_basic_unwind_proportional_to_overshoot(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    ctrl.backend._pressures[1] = 16.0
+    ctrl.tick(dt=0.1)
+    # kp=10 deg/s/psi, err=1 psi, dt=0.1 -> slack -= 1.0 deg.
+    assert ctrl._basic_slack_deg == pytest.approx(-1.0, abs=1e-6)
+
+
+def test_basic_unwind_clamped_at_max_rate(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    ctrl.backend._pressures[1] = 25.0  # +10 psi -> kp*10=100, clamped to 30.
+    ctrl.tick(dt=0.1)
+    assert ctrl._basic_slack_deg == pytest.approx(-3.0, abs=1e-6)
+
+
+def test_basic_unwind_gated_on_max_psi_across_all_balloons(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    for mid in range(1, 7):
+        ctrl.backend._pressures[mid] = 5.0
+    ctrl.backend._pressures[5] = 17.0  # +2 overshoot
+    ctrl.tick(dt=0.1)
+    assert ctrl._basic_slack_deg == pytest.approx(-2.0, abs=1e-6)
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING

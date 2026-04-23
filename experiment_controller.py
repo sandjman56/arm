@@ -55,6 +55,9 @@ class ExperimentController:
     # actual-pressure gate stalled for ~20 s at startup when firmware PID
     # deadband ate the initial ramp deltas.
     INFLATION_RATE_PER_S = 0.2    # full ramp in ~5 s (matches 2× stepper rate)
+    # Basic Elongation sub-mode tuning.
+    BASIC_UNWIND_KP_DEG_PER_S_PER_PSI = 10.0   # unwind rate per psi of overshoot
+    BASIC_UNWIND_MAX_DEG_PER_S = 30.0           # clamp on unwind rate
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -233,16 +236,22 @@ class ExperimentController:
                 return
 
         if self.state == State.ELONGATING:
-            self._advance_inflation_ramp(dt)
-            self._tick_elongating()
+            if self.mode == ExperimentMode.BASIC_ELONGATION:
+                self._tick_basic_elongating(dt)
+            else:
+                self._advance_inflation_ramp(dt)
+                self._tick_elongating()
         elif self.state == State.BENDING:
             self._tick_bending()
 
-        # Angle-control path: whenever defaults + baseline are latched, write
-        # composed tendon angles each tick so (a) slack tracks pressure smoothly
-        # during elongation/deflation, and (b) the bend P-controller layers on
-        # top during BENDING. Inactive in tests/sim that pass no defaults.
-        if self._servo_defaults is not None and self._psi_baseline is not None:
+        # Complex-mode angle-control path. Basic mode writes its own angles in
+        # _tick_basic_elongating() and must not double-write via
+        # _update_tendon_angles(), which uses Complex-mode slack/bend formulas.
+        if (
+            self.mode == ExperimentMode.COMPLEX
+            and self._servo_defaults is not None
+            and self._psi_baseline is not None
+        ):
             self._update_tendon_angles()
 
     def _tick_elongating(self) -> None:
@@ -278,6 +287,27 @@ class ExperimentController:
                 target_roll = self._theta_target * math.sin(self._phi_target)
                 self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
             self.state = State.BENDING
+
+    def _tick_basic_elongating(self, dt: float) -> None:
+        """Basic-mode elongation tick: P-controller on max-psi -> tendon unwind."""
+        pressures = self.backend.read_state().module_pressures_psi
+        max_psi = max(pressures.values()) if pressures else 0.0
+        err = max(0.0, max_psi - self._basic_psi_threshold)
+        rate = min(
+            self.BASIC_UNWIND_KP_DEG_PER_S_PER_PSI * err,
+            self.BASIC_UNWIND_MAX_DEG_PER_S,
+        )
+        self._basic_slack_deg -= rate * dt
+        if self._servo_defaults is not None:
+            for sid in (1, 2, 3, 4):
+                default = self._servo_defaults.get(sid, 0.0)
+                angle = default + self._basic_slack_deg
+                self.last_tendon_angles[sid] = angle
+                self.backend.set_tendon_angle(sid, angle)
+
+    def basic_elongation_mm(self) -> float:
+        """Current integrated elongation in mm (Basic mode only)."""
+        return self._basic_elongation_mm
 
     def _finish(self, timed_out: bool) -> None:
         elapsed = time.monotonic() - self._phase_start
