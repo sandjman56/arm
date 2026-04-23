@@ -86,7 +86,8 @@ def test_basic_unwind_zero_when_under_threshold(ctrl):
     ctrl.mode = ExperimentMode.BASIC_ELONGATION
     ctrl.start_zeroing()
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0)
+    # Low ceiling -> all modules start under threshold.
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, pressure_ceiling_psi=10.0)
     for _ in range(10):
         ctrl.tick(dt=0.1)
     assert ctrl._basic_slack_deg == 0.0
@@ -97,7 +98,7 @@ def test_basic_unwind_proportional_to_overshoot(ctrl):
     ctrl.mode = ExperimentMode.BASIC_ELONGATION
     ctrl.start_zeroing()
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0, pressure_ceiling_psi=10.0)
     ctrl.backend._pressures[1] = 16.0
     ctrl.tick(dt=0.1)
     # kp=10 deg/s/psi, err=1 psi, dt=0.1 -> slack -= 1.0 deg.
@@ -133,7 +134,7 @@ def test_basic_elongation_derived_from_slack_and_pulley_radius(ctrl):
     ctrl.mode = ExperimentMode.BASIC_ELONGATION
     ctrl.start_zeroing()
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0, pressure_ceiling_psi=10.0)
     ctrl.backend._pressures[1] = 16.0  # +1 psi overshoot -> 10 deg/s unwind
     for _ in range(5):
         ctrl.tick(dt=0.1)
@@ -180,6 +181,28 @@ def test_basic_no_bending_state_ever_reached(ctrl):
         assert ctrl.state != State.BENDING
         if ctrl.state == State.REACHED:
             break
+
+
+def test_basic_reach_commands_flat_pressure_setpoint(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(
+        z_target_mm=30.0, psi_threshold=15.0, pressure_ceiling_psi=20.0
+    )
+    for mid in range(1, 7):
+        assert ctrl.backend._pressures[mid] == 20.0
+
+
+def test_basic_reach_falls_back_to_threshold_plus_5_if_no_ceiling(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0)
+    for mid in range(1, 7):
+        assert ctrl.backend._pressures[mid] == 20.0
 
 
 def test_start_zeroing_transitions_to_ZEROING(ctrl):

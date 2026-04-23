@@ -208,7 +208,17 @@ class ExperimentController:
         self._basic_slack_deg = 0.0
         self._basic_elongation_mm = 0.0
         self._pressure_ceiling_psi = pressure_ceiling_psi
-        # Flat per-module setpoint (Task 7 adds the actual commands).
+        # Flat per-module setpoint: operator ceiling wins; otherwise threshold+5.
+        flat_setpoint = (
+            pressure_ceiling_psi if pressure_ceiling_psi is not None
+            else psi_threshold + 5.0
+        )
+        self._pressure_setpoints = {}
+        for mid in range(1, 7):
+            if mid in self.EXCLUDED_MODULES:
+                continue
+            self._pressure_setpoints[mid] = flat_setpoint
+            self.backend.set_module_pressure(mid, flat_setpoint)
         self._phase_start = time.monotonic()
         self.state = State.ELONGATING
 
