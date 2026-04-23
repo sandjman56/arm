@@ -304,6 +304,9 @@ class ExperimentController:
                 angle = default + self._basic_slack_deg
                 self.last_tendon_angles[sid] = angle
                 self.backend.set_tendon_angle(sid, angle)
+        self._basic_elongation_mm = (
+            math.radians(-self._basic_slack_deg) * self.PULLEY_RADIUS_MM
+        )
 
     def basic_elongation_mm(self) -> float:
         """Current integrated elongation in mm (Basic mode only)."""

@@ -128,6 +128,29 @@ def test_basic_unwind_gated_on_max_psi_across_all_balloons(ctrl):
     assert ctrl._basic_slack_deg == pytest.approx(-2.0, abs=1e-6)
 
 
+def test_basic_elongation_derived_from_slack_and_pulley_radius(ctrl):
+    from experiment_controller import ExperimentMode, ExperimentController
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=1000.0, psi_threshold=15.0)
+    ctrl.backend._pressures[1] = 16.0  # +1 psi overshoot -> 10 deg/s unwind
+    for _ in range(5):
+        ctrl.tick(dt=0.1)
+    # 5 ticks * 0.1s * 10 deg/s = 5 deg slack
+    expected_mm = math.radians(5.0) * ExperimentController.PULLEY_RADIUS_MM
+    assert ctrl._basic_elongation_mm == pytest.approx(expected_mm, rel=1e-6)
+
+
+def test_basic_elongation_mm_accessor(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0)
+    assert ctrl.basic_elongation_mm() == 0.0
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING
