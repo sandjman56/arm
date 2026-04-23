@@ -90,7 +90,7 @@ class ExperimentController:
     def start_zeroing(self) -> None:
         self.state = State.ZEROING
 
-    def confirm_zero(self) -> None:
+    def confirm_zero(self, servo_defaults: Optional[Dict[int, float]] = None) -> None:
         if self.state != State.ZEROING:
             return
         self.backend.capture_zero()
@@ -100,6 +100,8 @@ class ExperimentController:
         self._psi_baseline = {
             mid: p for mid, p in pressures.items() if mid not in self.EXCLUDED_MODULES
         }
+        if servo_defaults is not None:
+            self._servo_defaults = dict(servo_defaults)
         self.state = State.WAITING_FOR_TARGET
 
     def emergency_stop(self) -> None:

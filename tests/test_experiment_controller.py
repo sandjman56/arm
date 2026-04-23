@@ -33,6 +33,19 @@ def test_controller_mode_can_be_set_to_basic(ctrl):
     assert ctrl.mode == ExperimentMode.BASIC_ELONGATION
 
 
+def test_confirm_zero_latches_servo_defaults(ctrl):
+    ctrl.start_zeroing()
+    defaults = {1: 30.0, 2: 40.0, 3: 50.0, 4: 60.0}
+    ctrl.confirm_zero(servo_defaults=defaults)
+    assert ctrl._servo_defaults == defaults
+
+
+def test_confirm_zero_without_servo_defaults_leaves_them_none(ctrl):
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    assert ctrl._servo_defaults is None
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING
