@@ -46,6 +46,13 @@ class ArmUI:
         self._exp_prev_state = None
         self._exp_prev_connected = False
 
+        # Per-module stepper activity tracking. A stepper is "active" when
+        # its reported step_position has changed within STEPPER_ACTIVE_WINDOW_S.
+        # Used to light up per-module indicators on the experiments panel.
+        self._stepper_last_pos: dict = {}
+        self._stepper_last_change: dict = {}
+        self.STEPPER_ACTIVE_WINDOW_S = 0.3
+
         self.status = tk.StringVar(value="SELECT PORT AND CONNECT")
         self.connection = tk.StringVar(value="Not connected")
         self.port_var = tk.StringVar()
@@ -316,6 +323,8 @@ class ArmUI:
             on_clear=self.cal_clear,
             on_module_change=self._cal_on_module_change,
             on_emergency_stop=self.emergency_stop,
+            on_length_test_start=self._length_test_start,
+            on_length_test_stop=self._length_test_stop,
         )
 
         # Experiments mode: backend + controller + panel.
@@ -338,6 +347,7 @@ class ArmUI:
             on_confirm_zero=self._exp_confirm_zero,
             on_rezero=self._exp_rezero,
             on_reach=self._exp_reach,
+            on_reach_basic=self._exp_reach_basic,
             on_emergency_stop=self._exp_emergency_stop,
         )
         # Rolling yaw history for drift estimation.
@@ -517,7 +527,16 @@ class ArmUI:
         self.experiment_panel.set_status("Zeroing — confirm trunk is at rest, then Confirm Zero")
 
     def _exp_confirm_zero(self):
-        self.experiment_controller.confirm_zero()
+        # Latch the current tendon-servo slider values as the controller's
+        # _servo_defaults. Option A: both modes use the snapshot taken here.
+        try:
+            servo_defaults = {
+                sid: int(self.burst_panel._servo_vars[sid - 1].get())
+                for sid in (1, 2, 3, 4)
+            }
+        except (AttributeError, IndexError):
+            servo_defaults = None
+        self.experiment_controller.confirm_zero(servo_defaults=servo_defaults)
         self.experiment_panel.set_status("Zero captured — pick a target")
 
     def _exp_rezero(self):
@@ -527,6 +546,8 @@ class ArmUI:
             self.experiment_panel.set_status("Re-zero blocked — pressures not near rest")
 
     def _exp_reach(self, target_display):
+        from experiment_controller import ExperimentMode
+        self.experiment_controller.mode = ExperimentMode.COMPLEX
         # Translate target from display frame (zero-relative) to physics frame
         # (base-relative). Display frame origin = (0, 0, L_rest).
         tx, ty, tz = target_display
@@ -571,6 +592,37 @@ class ArmUI:
         self._exp_prev_state = self.experiment_controller.state
         self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
 
+    def _exp_reach_basic(self, z_target_mm: float, psi_threshold: float):
+        from experiment_controller import ExperimentMode
+        self.experiment_controller.mode = ExperimentMode.BASIC_ELONGATION
+        from tkinter import simpledialog
+        ceiling = simpledialog.askfloat(
+            "Reach - Pressure Ceiling",
+            "Max per-module pressure (psi absolute):",
+            parent=self.root, minvalue=14.0, maxvalue=25.0, initialvalue=18.0,
+        )
+        if ceiling is None:
+            self.experiment_panel.set_status("Reach cancelled (no ceiling)")
+            return
+        try:
+            self.experiment_controller.reach_basic(
+                z_target_mm=z_target_mm,
+                psi_threshold=psi_threshold,
+                pressure_ceiling_psi=ceiling,
+            )
+            self.experiment_panel.set_status(
+                f"Basic Reach: Z={z_target_mm:.1f}mm "
+                f"threshold={psi_threshold:.1f}psi (<={ceiling:.1f})"
+            )
+        except ValueError as e:
+            self.experiment_panel.set_status(f"Rejected: {e}")
+            return
+        if not self.logger.is_active:
+            self.start_log()
+            self._exp_auto_logging = True
+        self._exp_prev_state = self.experiment_controller.state
+        self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
+
     def _exp_emergency_stop(self):
         self.experiment_controller.emergency_stop()
         self.experiment_panel.set_status("EMERGENCY STOP")
@@ -590,6 +642,19 @@ class ArmUI:
             return 0.0
         drift_rad_per_s = (current_yaw_rad - y0) / dt
         return _m.degrees(drift_rad_per_s) * 60.0
+
+    # ===========================
+    # STEPPER ACTIVITY
+    # ===========================
+    def _note_step_position(self, module_id: int, pos: int) -> None:
+        """Record a position report; if position changed since the last report,
+        stamp the module as recently-active so the experiments panel can
+        light its activity dot."""
+        import time as _t
+        prev = self._stepper_last_pos.get(module_id)
+        if prev is None or pos != prev:
+            self._stepper_last_change[module_id] = _t.monotonic()
+        self._stepper_last_pos[module_id] = pos
 
     # ===========================
     # PID CONTROL
@@ -812,6 +877,7 @@ class ArmUI:
                                         mod["step_position"].set(pos)
                                         self.stepper_bar.set_position(mod_id, pos)
                                         self.cal_panel.set_position(mod_id, pos)
+                                        self._note_step_position(mod_id, pos)
                                     except ValueError:
                                         pass
                                 break
@@ -832,6 +898,7 @@ class ArmUI:
                                 mod["step_position"].set(pos)
                                 self.stepper_bar.set_position(mod_id, pos)
                                 self.cal_panel.set_position(mod_id, pos)
+                                self._note_step_position(mod_id, pos)
                                 break
                     except (ValueError, IndexError):
                         pass
@@ -925,10 +992,27 @@ class ArmUI:
                     if self.experiment_controller.last_result else ""
                 ),
             )
+            if self.experiment_panel.current_submode() == "BASIC":
+                pressures = s.module_pressures_psi
+                max_psi = max(pressures.values()) if pressures else 0.0
+                self.experiment_panel.set_basic_readouts(
+                    elongation_mm=self.experiment_controller.basic_elongation_mm(),
+                    z_target_mm=self.experiment_controller._basic_z_target_mm,
+                    slack_deg=self.experiment_controller._basic_slack_deg,
+                    max_psi=max_psi,
+                )
             # Pass tip in display frame (picker rendering) and arc in physics
             # frame (preview rendering). Panel handles the frame split.
             arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
             self.experiment_panel.set_tip_position(tip_zero, arc_pts_base)
+            # Light/dim each module's stepper-activity dot based on whether
+            # its reported position changed within the active window.
+            import time as _time_mod
+            _now_act = _time_mod.monotonic()
+            for mid in (1, 2, 3, 4, 5, 6):
+                last = self._stepper_last_change.get(mid)
+                active = last is not None and (_now_act - last) < self.STEPPER_ACTIVE_WINDOW_S
+                self.experiment_panel.set_stepper_active(mid, active)
             # Emit one log row per tick while logging is active.
             if self.logger.is_active:
                 pressures = s.module_pressures_psi
@@ -950,6 +1034,8 @@ class ArmUI:
                     f"{_m.degrees(s.roll):.3f}",
                     f"{_m.degrees(s.yaw):.3f}",
                     self.experiment_controller.state.value,
+                    f"{self.experiment_controller.current_slack_deg():.3f}",
+                    f"{self.experiment_controller.pressure_sum_delta_psi():.4f}",
                 ])
         except Exception as e:
             # Keep the main loop alive even if the experiment panel breaks.
@@ -985,6 +1071,26 @@ class ArmUI:
         self.logger.stop()
         self.status.set("LOGGING STOPPED")
         self._exp_auto_logging = False
+
+    def _length_test_start(self):
+        """Start a length-calibration log (filename prefix: `length_test`).
+
+        Used by the Calibration panel's Length subtab. Does nothing if a log
+        is already active — the user must stop the current one first."""
+        if self.logger.is_active:
+            self.cal_panel.set_length_test_active(True, filename="(already logging)")
+            self.status.set("LOGGING ALREADY ACTIVE")
+            return
+        name = self.logger.start(prefix="length_test")
+        if name:
+            self.status.set(f"LOGGING: {name}")
+            self.cal_panel.set_length_test_active(True, filename=name)
+
+    def _length_test_stop(self):
+        if self.logger.is_active:
+            self.logger.stop()
+            self.status.set("LOGGING STOPPED")
+        self.cal_panel.set_length_test_active(False)
 
     def _exp_auto_log_stop(self):
         """Stop logging only if we auto-started it for a reach."""
