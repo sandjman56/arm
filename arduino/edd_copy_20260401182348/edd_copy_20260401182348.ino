@@ -30,10 +30,10 @@ Servo bendServoD;
 
 // Last angle each servo was commanded to. Updated on every SERVOS command.
 // Startup default positions (also re-applied on every boot).
-#define BEND_DEFAULT_A    -8
-#define BEND_DEFAULT_B   -11
-#define BEND_DEFAULT_C   157
-#define BEND_DEFAULT_D   272
+#define BEND_DEFAULT_A     0
+#define BEND_DEFAULT_B    14
+#define BEND_DEFAULT_C   192
+#define BEND_DEFAULT_D   292
 int lastAngleA = BEND_DEFAULT_A;
 int lastAngleB = BEND_DEFAULT_B;
 int lastAngleC = BEND_DEFAULT_C;

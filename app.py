@@ -22,7 +22,7 @@ from widgets import (
 from arduino_interface import ArduinoInterface
 from logger import CSVLogger
 from graph import PressureGraph
-from panels import BurstPanel, PIDPanel, CalibrationPanel, ExperimentPanel
+from panels import BurstPanel, PIDPanel, CalibrationPanel, ExperimentPanel, EvaluationPanel
 
 
 class ArmUI:
@@ -295,7 +295,8 @@ class ArmUI:
                 fg=ACCENT_CYAN, bg=BG_PRIMARY).pack(side="left", padx=(0, 10))
 
         for text, val in [("Burst Control", "burst"), ("PID Control", "pid"),
-                          ("Calibration", "calibration"), ("Experiments", "experiments")]:
+                          ("Calibration", "calibration"), ("Experiments", "experiments"),
+                          ("Evaluation", "evaluation")]:
             rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode,
                                  value=val, command=self.switch_mode)
             rb.pack(side="left", padx=10)
@@ -349,6 +350,12 @@ class ArmUI:
             on_reach=self._exp_reach,
             on_reach_basic=self._exp_reach_basic,
             on_emergency_stop=self._exp_emergency_stop,
+        )
+
+        # Evaluation mode: offline plotting of existing CSV logs.
+        self.evaluation_panel = EvaluationPanel(
+            self.panel_container,
+            logger_dir=self.logger.output_dir,
         )
         # Rolling yaw history for drift estimation.
         self._yaw_history = deque(maxlen=600)  # ~60s at 10Hz
@@ -426,6 +433,7 @@ class ArmUI:
                 self._conn_dot.set_color(ACCENT_GREEN)
                 threading.Thread(target=self.reader, daemon=True).start()
                 self.root.after(500, self.load_calibration)
+                self.root.after(600, self._push_servo_defaults)
             else:
                 self.connection.set("Not connected")
                 self.status.set("CONNECTION FAILED")
@@ -471,6 +479,7 @@ class ArmUI:
         self.pid_panel.pack_forget()
         self.cal_panel.pack_forget()
         self.experiment_panel.pack_forget()
+        self.evaluation_panel.pack_forget()
 
         mode = self.mode.get()
         if mode == "burst":
@@ -500,6 +509,8 @@ class ArmUI:
                 theta_max_rad=1.0472,
             )
             self.experiment_panel.pack(fill="both", expand=True)
+        elif mode == "evaluation":
+            self.evaluation_panel.pack(fill="both", expand=True)
 
     # ===========================
     # EXPERIMENTS
@@ -860,6 +871,15 @@ class ArmUI:
                             for mid, v in sorted(self.cal_limits.items()))
         self.status.set(f"CALIBRATION LOADED: {summary}")
 
+    def _push_servo_defaults(self):
+        """Sync firmware servo positions to the burst panel's current slider
+        values right after connect. Without this, Reach writes the latched
+        UI angles in one tick and any firmware/UI mismatch shows up as a
+        visible jump (pin-9 servo had a ~92° overwind with the old defaults)."""
+        if not self.arduino.ser or not self.arduino.ser.is_open:
+            return
+        self.burst_panel.push_servos()
+
     # ===========================
     # UPDATE LOOP
     # ===========================
@@ -1059,10 +1079,20 @@ class ArmUI:
             from experiment_controller import State as _ExpState
             cur_state = self.experiment_controller.state
             cur_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
-            reached = (
-                self._exp_prev_state not in (_ExpState.REACHED, _ExpState.TIMED_OUT)
-                and cur_state in (_ExpState.REACHED, _ExpState.TIMED_OUT)
+            # End-of-cycle stop triggers:
+            #   complex mode: BENDING -> REACHED (or -> TIMED_OUT)
+            #   basic mode:   RETRACTING -> REACHED (full reach + return)
+            # Basic mode also tags the target-reach moment with REACHED (from
+            # ELONGATING), but retract is still pending -- don't stop there.
+            entered_reached = (
+                cur_state == _ExpState.REACHED
+                and self._exp_prev_state not in (_ExpState.REACHED, _ExpState.ELONGATING)
             )
+            entered_timeout = (
+                cur_state == _ExpState.TIMED_OUT
+                and self._exp_prev_state != _ExpState.TIMED_OUT
+            )
+            reached = entered_reached or entered_timeout
             conn_dropped = self._exp_prev_connected and not cur_connected
             if reached or conn_dropped:
                 self._exp_auto_log_stop()
