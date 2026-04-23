@@ -151,6 +151,37 @@ def test_basic_elongation_mm_accessor(ctrl):
     assert ctrl.basic_elongation_mm() == 0.0
 
 
+def test_basic_reaches_when_elongation_hits_target(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    z_target = 5.0
+    ctrl.reach_basic(z_target_mm=z_target, psi_threshold=15.0)
+    ctrl.backend._pressures[1] = 25.0  # overshoot -> clamped 30 deg/s
+    # ~13 mm/s -> ~0.4s to hit 5mm
+    for _ in range(40):
+        ctrl.tick(dt=0.05)
+        if ctrl.state == State.REACHED:
+            break
+    assert ctrl.state == State.REACHED
+    assert ctrl._basic_elongation_mm >= z_target
+
+
+def test_basic_no_bending_state_ever_reached(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(z_target_mm=5.0, psi_threshold=15.0)
+    ctrl.backend._pressures[1] = 25.0
+    for _ in range(200):
+        ctrl.tick(dt=0.05)
+        assert ctrl.state != State.BENDING
+        if ctrl.state == State.REACHED:
+            break
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING

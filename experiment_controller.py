@@ -307,6 +307,16 @@ class ExperimentController:
         self._basic_elongation_mm = (
             math.radians(-self._basic_slack_deg) * self.PULLEY_RADIUS_MM
         )
+        if self._basic_elongation_mm >= self._basic_z_target_mm:
+            self._hold_pressures_at_current()
+            elapsed = time.monotonic() - self._phase_start
+            self._last_result = RunResult(
+                final_pitch_err_rad=0.0,
+                final_position_err_mm=0.0,
+                elapsed_s=elapsed,
+                timed_out=False,
+            )
+            self.state = State.REACHED
 
     def basic_elongation_mm(self) -> float:
         """Current integrated elongation in mm (Basic mode only)."""
