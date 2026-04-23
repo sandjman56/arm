@@ -20,7 +20,7 @@ class BurstPanel(tk.Frame):
 
         # One IntVar per servo (A/B/C/D -> pins 9/10/11/24). Sliders are
         # UI-only; angles are not sent to the firmware until Save is pressed.
-        self._servo_defaults = (-8, -11, 157, 272)
+        self._servo_defaults = (0, 14, 192, 292)
         self._servo_vars = [tk.IntVar(value=v) for v in self._servo_defaults]
 
         self._build()
@@ -92,7 +92,7 @@ class BurstPanel(tk.Frame):
                 command=lambda sid=servo_id: self._nudge_servo(sid, -5),
             ).pack(side="right")
             tk.Scale(
-                bend_box, from_=-360, to=360, orient="horizontal",
+                bend_box, from_=-1000, to=1000, orient="horizontal",
                 variable=self._servo_vars[servo_id - 1], showvalue=True,
                 length=220,
                 bg=BG_PANEL, fg=TEXT_PRIMARY, troughcolor=BG_PRIMARY,
@@ -111,12 +111,20 @@ class BurstPanel(tk.Frame):
 
     def _nudge_servo(self, servo_id, delta):
         var = self._servo_vars[servo_id - 1]
-        new_val = max(-360, min(360, var.get() + delta))
+        new_val = max(-1000, min(1000, var.get() + delta))
         var.set(new_val)
         self._on_send(f"SERVO,{servo_id},{new_val}")
 
     def _on_save_servos(self):
-        a, b, c, d = (v.get() for v in self._servo_vars)
+        self.push_servos()
+
+    def current_servo_angles(self):
+        """Current UI slider values in servo-id order (A, B, C, D)."""
+        return tuple(int(v.get()) for v in self._servo_vars)
+
+    def push_servos(self):
+        """Send the bulk SERVOS command with the current slider values."""
+        a, b, c, d = self.current_servo_angles()
         self._on_send(f"SERVOS,{a},{b},{c},{d}")
 
     def _rebuild_modules(self):
