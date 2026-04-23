@@ -59,6 +59,14 @@ class ExperimentController:
     # Basic Elongation sub-mode tuning.
     BASIC_UNWIND_KP_DEG_PER_S_PER_PSI = 10.0   # unwind rate per psi of overshoot
     BASIC_UNWIND_MAX_DEG_PER_S = 30.0           # clamp on unwind rate
+    # Retraction safety: soft-start ramp so the reverse motion eases in from
+    # zero rather than slamming to full rate at the instant of target-reach.
+    # Linear ramp from 0 to target rate over BASIC_RETRACT_RAMP_S seconds.
+    BASIC_RETRACT_RAMP_S = 0.5
+    # Hard absolute ceiling on per-tick servo step during retraction,
+    # independent of speed_scale. Bounds worst-case motion if the UI ever
+    # sends a pathological speed value.
+    BASIC_RETRACT_MAX_STEP_DEG = 3.0
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -89,6 +97,7 @@ class ExperimentController:
         self._basic_speed_scale: float = 1.0
         self._basic_slack_deg: float = 0.0
         self._basic_elongation_mm: float = 0.0
+        self._basic_retract_elapsed_s: float = 0.0
 
     # --- Transitions -------------------------------------------------------
 
@@ -338,6 +347,7 @@ class ExperimentController:
             # Do not freeze pressures - reverse phase will drop them toward
             # baseline while servos wind back to their start angles.
             self._phase_start = time.monotonic()
+            self._basic_retract_elapsed_s = 0.0
             self.state = State.RETRACTING
 
     def basic_elongation_mm(self) -> float:
@@ -347,10 +357,22 @@ class ExperimentController:
     def _tick_basic_retracting(self, dt: float) -> None:
         """Reverse the basic-mode motion: wind servos back up at the set rate
         while modules deflate toward baseline. Terminal state is REACHED
-        (baseline)."""
-        # Constant wind rate (positive = winding toward default angle).
-        rate = self.BASIC_UNWIND_MAX_DEG_PER_S * self._basic_speed_scale
-        self._basic_slack_deg = min(0.0, self._basic_slack_deg + rate * dt)
+        (baseline).
+
+        Safety: rate eases in from zero over BASIC_RETRACT_RAMP_S so there's
+        no sudden step at the ELONGATING->RETRACTING transition, and any
+        single-tick slack change is clamped to BASIC_RETRACT_MAX_STEP_DEG
+        regardless of speed_scale. Ramp uses accumulated sim dt, not wall
+        clock, so it works correctly under tests and real-time alike."""
+        self._basic_retract_elapsed_s += dt
+        if self.BASIC_RETRACT_RAMP_S > 0:
+            ease = min(1.0, self._basic_retract_elapsed_s / self.BASIC_RETRACT_RAMP_S)
+        else:
+            ease = 1.0
+        target_rate = self.BASIC_UNWIND_MAX_DEG_PER_S * self._basic_speed_scale
+        rate = target_rate * ease
+        step = min(rate * dt, self.BASIC_RETRACT_MAX_STEP_DEG)
+        self._basic_slack_deg = min(0.0, self._basic_slack_deg + step)
         # Write composed tendon angles.
         if self._servo_defaults is not None:
             for sid in (1, 2, 3, 4):

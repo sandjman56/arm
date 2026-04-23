@@ -261,31 +261,50 @@ def test_basic_target_reached_transitions_to_retracting(ctrl):
     assert ctrl._basic_elongation_mm >= 3.0
 
 
-def test_basic_retracting_winds_slack_back_up_at_set_rate(ctrl):
+def test_basic_retracting_first_tick_eases_in_from_zero(ctrl):
     from experiment_controller import ExperimentMode
     ctrl.mode = ExperimentMode.BASIC_ELONGATION
     ctrl.start_zeroing()
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=1.0)
-    # Force into RETRACTING with a known starting slack.
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=10.0)
     ctrl._basic_slack_deg = -20.0
     ctrl.state = State.RETRACTING
-    ctrl.tick(dt=0.1)
-    # rate = 30 deg/s * 1.0 * 0.1s = 3.0 deg
-    assert ctrl._basic_slack_deg == pytest.approx(-17.0, abs=1e-6)
+    ctrl._basic_retract_elapsed_s = 0.0
+    ctrl.tick(dt=0.01)
+    # After 1 tick, elapsed=0.01, ease=0.02. rate=300*0.02=6 deg/s.
+    # step = 6*0.01 = 0.06 deg - far below clamp.
+    assert ctrl._basic_slack_deg == pytest.approx(-19.94, abs=1e-3)
 
 
-def test_basic_retracting_honors_speed_scale(ctrl):
+def test_basic_retracting_step_clamp_bounds_worst_case(ctrl):
+    from experiment_controller import ExperimentMode, ExperimentController
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    # Pathological speed x dt that would otherwise produce a 100-deg jump.
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=10.0)
+    ctrl._basic_slack_deg = -50.0
+    ctrl.state = State.RETRACTING
+    ctrl._basic_retract_elapsed_s = 10.0  # ramp fully past
+    ctrl.tick(dt=0.5)
+    # Even with rate = 300 deg/s * dt = 150, step clamp holds it to 3 deg.
+    assert ctrl._basic_slack_deg == pytest.approx(
+        -50.0 + ExperimentController.BASIC_RETRACT_MAX_STEP_DEG, abs=1e-6
+    )
+
+
+def test_basic_retracting_reaches_full_rate_after_ramp(ctrl):
     from experiment_controller import ExperimentMode
     ctrl.mode = ExperimentMode.BASIC_ELONGATION
     ctrl.start_zeroing()
     ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
-    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=2.0)
+    ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0, speed_scale=0.5)
     ctrl._basic_slack_deg = -20.0
     ctrl.state = State.RETRACTING
+    ctrl._basic_retract_elapsed_s = 10.0  # past ramp
     ctrl.tick(dt=0.1)
-    # rate = 30 * 2.0 * 0.1 = 6.0 deg
-    assert ctrl._basic_slack_deg == pytest.approx(-14.0, abs=1e-6)
+    # target_rate = 30 * 0.5 = 15 deg/s. step = 1.5 deg (under 3-deg clamp).
+    assert ctrl._basic_slack_deg == pytest.approx(-18.5, abs=1e-6)
 
 
 def test_basic_retracting_clamps_slack_at_zero(ctrl):
@@ -296,6 +315,7 @@ def test_basic_retracting_clamps_slack_at_zero(ctrl):
     ctrl.reach_basic(z_target_mm=100.0, psi_threshold=15.0)
     ctrl._basic_slack_deg = -1.0
     ctrl.state = State.RETRACTING
+    ctrl._basic_retract_elapsed_s = 10.0  # past ramp
     ctrl.tick(dt=1.0)  # plenty of time to overshoot
     assert ctrl._basic_slack_deg == 0.0
     assert ctrl.state == State.REACHED
