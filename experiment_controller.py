@@ -58,6 +58,15 @@ class ExperimentController:
     # Basic Elongation sub-mode tuning.
     BASIC_UNWIND_KP_DEG_PER_S_PER_PSI = 10.0   # unwind rate per psi of overshoot
     BASIC_UNWIND_MAX_DEG_PER_S = 30.0           # clamp on unwind rate
+    # Servo starting angles for Basic elongation runs. These are the rest
+    # angles the operator has calibrated the rig to; the unwind P-controller
+    # composes slack (always negative) on top.
+    BASIC_SERVO_DEFAULTS: Dict[int, float] = {
+        1: -100.0,  # Servo A (pin 9)
+        2: 14.0,    # Servo B (pin 10)
+        3: 192.0,   # Servo C (pin 11)
+        4: 292.0,   # Servo D (pin 24)
+    }
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -85,6 +94,7 @@ class ExperimentController:
         # Basic-mode state.
         self._basic_z_target_mm: float = 0.0
         self._basic_psi_threshold: float = 15.0
+        self._basic_speed_scale: float = 1.0
         self._basic_slack_deg: float = 0.0
         self._basic_elongation_mm: float = 0.0
 
@@ -184,6 +194,7 @@ class ExperimentController:
         z_target_mm: float,
         psi_threshold: float,
         pressure_ceiling_psi: Optional[float] = None,
+        speed_scale: float = 1.0,
     ) -> None:
         """Begin a Basic Elongation run.
 
@@ -191,6 +202,10 @@ class ExperimentController:
         unwind driven by a P-controller on max-balloon-psi vs. threshold.
         Elongation is integrated from slack angle x pulley radius. Reach
         declared when elongation >= z_target_mm.
+
+        `speed_scale` multiplies both the unwind kp and the unwind max rate.
+        Steppers benefit indirectly: faster unwind means balloons keep
+        expanding, so the firmware PID has room to keep pumping.
         """
         if self.mode != ExperimentMode.BASIC_ELONGATION:
             raise ValueError("reach_basic requires BASIC_ELONGATION mode")
@@ -203,8 +218,11 @@ class ExperimentController:
             raise ValueError(
                 "servo defaults not latched - press Confirm Zero with servo angles first"
             )
+        if speed_scale <= 0:
+            raise ValueError(f"speed_scale must be positive, got {speed_scale}")
         self._basic_z_target_mm = float(z_target_mm)
         self._basic_psi_threshold = float(psi_threshold)
+        self._basic_speed_scale = float(speed_scale)
         self._basic_slack_deg = 0.0
         self._basic_elongation_mm = 0.0
         self._pressure_ceiling_psi = pressure_ceiling_psi
@@ -303,9 +321,10 @@ class ExperimentController:
         pressures = self.backend.read_state().module_pressures_psi
         max_psi = max(pressures.values()) if pressures else 0.0
         err = max(0.0, max_psi - self._basic_psi_threshold)
+        scale = self._basic_speed_scale
         rate = min(
-            self.BASIC_UNWIND_KP_DEG_PER_S_PER_PSI * err,
-            self.BASIC_UNWIND_MAX_DEG_PER_S,
+            self.BASIC_UNWIND_KP_DEG_PER_S_PER_PSI * scale * err,
+            self.BASIC_UNWIND_MAX_DEG_PER_S * scale,
         )
         self._basic_slack_deg -= rate * dt
         if self._servo_defaults is not None:

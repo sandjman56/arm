@@ -205,6 +205,46 @@ def test_basic_reach_falls_back_to_threshold_plus_5_if_no_ceiling(ctrl):
         assert ctrl.backend._pressures[mid] == 20.0
 
 
+def test_basic_speed_scale_multiplies_unwind_rate(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(
+        z_target_mm=1000.0, psi_threshold=15.0,
+        pressure_ceiling_psi=10.0, speed_scale=2.5,
+    )
+    ctrl.backend._pressures[1] = 16.0  # +1 psi overshoot
+    ctrl.tick(dt=0.1)
+    # kp=10 * 2.5 = 25 deg/s/psi, err=1 psi, dt=0.1 -> slack -= 2.5 deg.
+    assert ctrl._basic_slack_deg == pytest.approx(-2.5, abs=1e-6)
+
+
+def test_basic_speed_scale_also_raises_max_rate_clamp(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    ctrl.reach_basic(
+        z_target_mm=1000.0, psi_threshold=15.0,
+        pressure_ceiling_psi=10.0, speed_scale=2.0,
+    )
+    ctrl.backend._pressures[1] = 25.0  # +10 psi overshoot
+    ctrl.tick(dt=0.1)
+    # Unclamped: kp*scale*err = 10*2*10 = 200. Clamp: max*scale = 30*2 = 60.
+    # slack -= 60 * 0.1 = 6.0
+    assert ctrl._basic_slack_deg == pytest.approx(-6.0, abs=1e-6)
+
+
+def test_basic_reach_rejects_nonpositive_speed_scale(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    ctrl.start_zeroing()
+    ctrl.confirm_zero(servo_defaults={1: 0.0, 2: 0.0, 3: 0.0, 4: 0.0})
+    with pytest.raises(ValueError):
+        ctrl.reach_basic(z_target_mm=30.0, psi_threshold=15.0, speed_scale=0.0)
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING

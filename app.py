@@ -527,15 +527,27 @@ class ArmUI:
         self.experiment_panel.set_status("Zeroing — confirm trunk is at rest, then Confirm Zero")
 
     def _exp_confirm_zero(self):
-        # Latch the current tendon-servo slider values as the controller's
-        # _servo_defaults. Option A: both modes use the snapshot taken here.
-        try:
-            servo_defaults = {
-                sid: int(self.burst_panel._servo_vars[sid - 1].get())
-                for sid in (1, 2, 3, 4)
-            }
-        except (AttributeError, IndexError):
-            servo_defaults = None
+        from experiment_controller import ExperimentController
+        # In BASIC sub-mode, force the burst-panel sliders to the calibrated
+        # Basic-mode servo start angles, physically move the servos there,
+        # and latch those as the controller's _servo_defaults. In COMPLEX
+        # mode, snapshot whatever the operator has the sliders at.
+        if self.experiment_panel.current_submode() == "BASIC":
+            servo_defaults = dict(ExperimentController.BASIC_SERVO_DEFAULTS)
+            try:
+                for sid, angle in servo_defaults.items():
+                    self.burst_panel._servo_vars[sid - 1].set(int(angle))
+                    self.experiment_backend.set_tendon_angle(sid, float(angle))
+            except (AttributeError, IndexError):
+                pass
+        else:
+            try:
+                servo_defaults = {
+                    sid: int(self.burst_panel._servo_vars[sid - 1].get())
+                    for sid in (1, 2, 3, 4)
+                }
+            except (AttributeError, IndexError):
+                servo_defaults = None
         self.experiment_controller.confirm_zero(servo_defaults=servo_defaults)
         self.experiment_panel.set_status("Zero captured — pick a target")
 
@@ -592,7 +604,8 @@ class ArmUI:
         self._exp_prev_state = self.experiment_controller.state
         self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
 
-    def _exp_reach_basic(self, z_target_mm: float, psi_threshold: float):
+    def _exp_reach_basic(self, z_target_mm: float, psi_threshold: float,
+                         speed_scale: float):
         from experiment_controller import ExperimentMode
         self.experiment_controller.mode = ExperimentMode.BASIC_ELONGATION
         from tkinter import simpledialog
@@ -609,10 +622,12 @@ class ArmUI:
                 z_target_mm=z_target_mm,
                 psi_threshold=psi_threshold,
                 pressure_ceiling_psi=ceiling,
+                speed_scale=speed_scale,
             )
             self.experiment_panel.set_status(
                 f"Basic Reach: Z={z_target_mm:.1f}mm "
-                f"threshold={psi_threshold:.1f}psi (<={ceiling:.1f})"
+                f"threshold={psi_threshold:.1f}psi "
+                f"speed={speed_scale:.1f}x (<={ceiling:.1f})"
             )
         except ValueError as e:
             self.experiment_panel.set_status(f"Rejected: {e}")

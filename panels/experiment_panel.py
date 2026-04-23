@@ -72,6 +72,7 @@ class ExperimentPanel(tk.Frame):
         self.submode_var = tk.StringVar(value="BASIC")
         self.basic_z_var = tk.StringVar(value="20.0")
         self.basic_threshold_var = tk.StringVar(value="15.0")
+        self.basic_speed_var = tk.StringVar(value="2.0")
         self.basic_elongation_readout_var = tk.StringVar(value="Elongation: 0.0 / 0.0 mm")
         self.basic_slack_readout_var = tk.StringVar(value="Slack: 0.0 deg")
         self.basic_maxpsi_readout_var = tk.StringVar(value="Max psi: 0.0")
@@ -199,6 +200,10 @@ class ExperimentPanel(tk.Frame):
                  fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
         tk.Entry(basic_entry, textvariable=self.basic_threshold_var, width=6,
                  font=FONT_DATA).pack(side="left", padx=(4, 12))
+        tk.Label(basic_entry, text="Speed:", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(basic_entry, textvariable=self.basic_speed_var, width=5,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
         AccentButton(basic_entry, text="Reach", accent=ACCENT_GREEN,
                      command=self._handle_reach_basic).pack(side="left", padx=12)
 
@@ -244,10 +249,14 @@ class ExperimentPanel(tk.Frame):
         try:
             z = float(self.basic_z_var.get())
             threshold = float(self.basic_threshold_var.get())
+            speed = float(self.basic_speed_var.get())
         except ValueError:
-            self.status_var.set("Invalid input - Z and threshold must be numbers")
+            self.status_var.set("Invalid input - Z, threshold, speed must be numbers")
             return
-        self._on_reach_basic(z, threshold)
+        if speed <= 0:
+            self.status_var.set("Speed must be positive")
+            return
+        self._on_reach_basic(z, threshold, speed)
 
     def set_basic_readouts(self, elongation_mm: float, z_target_mm: float,
                            slack_deg: float, max_psi: float) -> None:
