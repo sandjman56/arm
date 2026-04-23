@@ -22,6 +22,17 @@ def test_initial_state_is_IDLE(ctrl):
     assert ctrl.state == State.IDLE
 
 
+def test_controller_defaults_to_complex_mode(ctrl):
+    from experiment_controller import ExperimentMode
+    assert ctrl.mode == ExperimentMode.COMPLEX
+
+
+def test_controller_mode_can_be_set_to_basic(ctrl):
+    from experiment_controller import ExperimentMode
+    ctrl.mode = ExperimentMode.BASIC_ELONGATION
+    assert ctrl.mode == ExperimentMode.BASIC_ELONGATION
+
+
 def test_start_zeroing_transitions_to_ZEROING(ctrl):
     ctrl.start_zeroing()
     assert ctrl.state == State.ZEROING
@@ -184,6 +195,64 @@ def test_bending_aborts_on_stale_IMU_in_live_mode():
     ctrl._phase_start = time.monotonic()
     ctrl.state = State.BENDING
     ctrl._target = (0.0, 0.0, 300.0)
+    ctrl.tick(dt=0.1)
+    assert ctrl.state == State.IDLE
+    assert be.sent_stops >= 1
+
+
+def test_reached_aborts_on_stale_IMU_in_live_mode():
+    """Stale IMU while holding pose in REACHED must also fire E-stop."""
+    from experiment_backend import BackendState
+    from length_calibration import LengthCalibration
+
+    class StaleBackend:
+        is_sim = False
+
+        def __init__(self):
+            self._p = {i + 1: 0.0 for i in range(6)}
+            self.sent_stops = 0
+            self._fresh = True
+
+        def read_state(self):
+            return BackendState(
+                total_length_mm=300.0, module_pressures_psi=dict(self._p),
+                pitch=0.0, roll=0.0, yaw=0.0, imu_fresh=self._fresh,
+            )
+
+        def read_orientation(self):
+            return (0.0, 0.0, 0.0)
+
+        def set_module_pressure(self, mid, psi):
+            self._p[mid] = psi
+
+        def set_tendon_rate(self, sid, rate):
+            pass
+
+        def capture_zero(self):
+            pass
+
+        def emergency_stop(self):
+            self.sent_stops += 1
+
+        def tick(self, dt):
+            pass
+
+        def set_total_length_target(self, L):
+            pass
+
+        def set_orientation_target(self, p, r, y):
+            pass
+
+    be = StaleBackend()
+    cal = LengthCalibration(is_default=True)
+    ctrl = ExperimentController(backend=be, calibration=cal)
+    ctrl.start_zeroing()
+    ctrl.confirm_zero()
+    ctrl.reach(target=(0.0, 0.0, 100.0))
+    # Force into REACHED (pose hold) and then drop IMU freshness.
+    ctrl.state = State.REACHED
+    ctrl._target = (0.0, 0.0, 100.0)
+    be._fresh = False
     ctrl.tick(dt=0.1)
     assert ctrl.state == State.IDLE
     assert be.sent_stops >= 1

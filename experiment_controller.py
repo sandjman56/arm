@@ -20,6 +20,11 @@ class State(enum.Enum):
     TIMED_OUT = "TIMED_OUT"
 
 
+class ExperimentMode(enum.Enum):
+    COMPLEX = "COMPLEX"
+    BASIC_ELONGATION = "BASIC_ELONGATION"
+
+
 @dataclass
 class RunResult:
     final_pitch_err_rad: float
@@ -29,9 +34,7 @@ class RunResult:
 
 
 class ExperimentController:
-    ELONGATION_TIMEOUT_S = 45.0
     MIN_ELONGATION_S = 2.0          # don't transition to BENDING sooner than this
-    BEND_TIMEOUT_S = 30.0
     TOL_ANGLE_RAD = math.radians(3)
     TOL_POS_MM = 10.0
     TOL_PRESSURE_PSI = 0.3  # per-module setpoint convergence
@@ -39,14 +42,25 @@ class ExperimentController:
     KP_BEND_ANGLE_DEG_PER_RAD = 30.0
     BEND_ANGLE_MAX_DEG = 45.0
     OMEGA_MAX = 1.0  # tendon rate saturation, in [-1, 1]
-    SLACK_PER_PSI = 10.0 / 0.3    # degrees of tendon slack per psi of aggregate module delta
-    SLACK_MAX_DEG = 90.0          # absolute clamp on magnitude of slack offset
-    EXCLUDED_MODULES = frozenset({6})  # no pressure sensor wired; skip for baseline/slack/pressurize
+    SLACK_MAX_DEG = 90.0          # common-mode tendon pay-out at full inflation
+    # Tendon pulley geometry — used to convert commanded servo angle change
+    # into arc-length change (ΔL = |Δθ| × r) during ELONGATING. Replaces the
+    # IMU as the length source during that phase (IMU stays responsible for
+    # orientation during BENDING only).
+    PULLEY_RADIUS_MM = 25.0       # 2.5 cm radius (5 cm diameter)
+    EXCLUDED_MODULES = frozenset()  # all 6 modules have pressure sensors wired
+    # Synchronized-inflation ramp. All modules' commanded pressures walk from
+    # baseline toward their finals via a single shared [0, 1] progress scalar
+    # that rises at INFLATION_RATE_PER_S. Open-loop on purpose — the previous
+    # actual-pressure gate stalled for ~20 s at startup when firmware PID
+    # deadband ate the initial ramp deltas.
+    INFLATION_RATE_PER_S = 0.2    # full ramp in ~5 s (matches 2× stepper rate)
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
         self.cal = calibration
         self.state = State.IDLE
+        self.mode: ExperimentMode = ExperimentMode.COMPLEX
         self._target: Optional[Tuple[float, float, float]] = None  # in physics frame
         self._phase_start: float = 0.0
         self._last_result: Optional[RunResult] = None
@@ -58,8 +72,18 @@ class ExperimentController:
         self._pressure_ceiling_psi: Optional[float] = None
         # Last commanded per-module pressure setpoints (for convergence check).
         self._pressure_setpoints: Dict[int, float] = {}
+        # Synchronized-inflation ramp state. `_inflation_final` holds the final
+        # per-module psi targets computed at reach(); `_inflation_progress` is
+        # the shared [0, 1] ramp fraction that tick() advances during ELONGATING.
+        self._inflation_final: Dict[int, float] = {}
+        self._inflation_progress: float = 0.0
         # Last commanded tendon-servo angles (for logging).
         self.last_tendon_angles: Dict[int, float] = {}
+        # Basic-mode state.
+        self._basic_z_target_mm: float = 0.0
+        self._basic_psi_threshold: float = 15.0
+        self._basic_slack_deg: float = 0.0
+        self._basic_elongation_mm: float = 0.0
 
     # --- Transitions -------------------------------------------------------
 
@@ -85,6 +109,9 @@ class ExperimentController:
         # Disengage the angle-control path. Baseline stays; operator must
         # re-Reach to re-arm tendon writes.
         self._servo_defaults = None
+        # Drop the inflation ramp; next reach() rebuilds it from baseline.
+        self._inflation_final = {}
+        self._inflation_progress = 0.0
 
     @property
     def last_result(self) -> Optional[RunResult]:
@@ -129,9 +156,18 @@ class ExperimentController:
         # Latch servo defaults (by value). None disables the angle-control path.
         self._servo_defaults = dict(servo_defaults) if servo_defaults is not None else None
         self._pressure_ceiling_psi = pressure_ceiling_psi
-        # Command module pressures for the requested arc length, clamped to
-        # the operator-supplied safety ceiling.
-        self._command_module_pressures_for_length(L_target)
+        # Precompute the final per-module psi targets and arm the synchronized
+        # inflation ramp. Initial commanded pressures are each module's baseline
+        # so the firmware PID latches on without an immediate burst; tick()
+        # walks every module up together during ELONGATING.
+        self._inflation_final = self._compute_module_pressure_targets(L_target)
+        self._inflation_progress = 0.0
+        self._pressure_setpoints = {}
+        baseline = self._psi_baseline or {}
+        for mid in self._inflation_final:
+            base = baseline.get(mid, 0.0)
+            self._pressure_setpoints[mid] = base
+            self.backend.set_module_pressure(mid, base)
         # In sim mode, poke the backend with the total length directly so its
         # slewing engine has a target.
         if hasattr(self.backend, "set_total_length_target"):
@@ -140,12 +176,29 @@ class ExperimentController:
 
     # --- Main tick ---------------------------------------------------------
 
+    _ACTIVE_STATES = frozenset({State.ELONGATING, State.BENDING, State.REACHED})
+    # ELONGATING is intentionally excluded from the IMU watchdog: during
+    # inflation the tip can swing visibly and the IMU is noisy enough that
+    # `imu_fresh` false positives would E-stop healthy runs. Length comes
+    # from the tendon-servo angles + pulley geometry in that phase, so the
+    # IMU isn't load-bearing until BENDING.
+    _IMU_WATCHDOG_STATES = frozenset({State.BENDING, State.REACHED})
+
     def tick(self, dt: float) -> None:
         """Advance the controller by dt seconds. Called ~20 Hz from the UI."""
         # Always let the backend advance first.
         self.backend.tick(dt)
 
+        # Live-mode IMU-staleness watchdog (spec §8). Active during BENDING
+        # and REACHED only — ELONGATING uses servo-angle-derived length and
+        # does not need a valid orientation estimate.
+        if self.state in self._IMU_WATCHDOG_STATES and not self.backend.is_sim:
+            if not self.backend.read_state().imu_fresh:
+                self.emergency_stop()
+                return
+
         if self.state == State.ELONGATING:
+            self._advance_inflation_ramp(dt)
             self._tick_elongating()
         elif self.state == State.BENDING:
             self._tick_bending()
@@ -164,10 +217,24 @@ class ExperimentController:
         # tendon slack pay-out are visible and physically complete.
         if elapsed < self.MIN_ELONGATION_S:
             return
-        length_converged = abs(s.total_length_mm - self._L_target) < 5.0
-        pressure_converged = bool(self._pressure_setpoints) and all(
-            abs(s.module_pressures_psi.get(mid, 0.0) - sp) < self.TOL_PRESSURE_PSI
-            for mid, sp in self._pressure_setpoints.items()
+        # Length during ELONGATING is derived from tendon servo angles + pulley
+        # radius; IMU is not consulted. On sim/tests where slack-comp isn't
+        # armed, fall back to the backend's own reading.
+        L_current = self._current_length_estimate_mm()
+        if hasattr(self.backend, "set_total_length_mm"):
+            self.backend.set_total_length_mm(L_current)
+        # Don't transition to BENDING until the synchronized inflation ramp
+        # has finished — pressure_converged otherwise trips against the
+        # slowly-advancing ramp-point setpoint (not the final target), which
+        # lets BENDING kick in with modules at ~20% inflation and swings the
+        # tendon servos antagonistically instead of letting them unwind
+        # together to match the already-inflating modules.
+        if self._inflation_progress < 1.0:
+            return
+        length_converged = abs(L_current - self._L_target) < 5.0
+        pressure_converged = bool(self._inflation_final) and all(
+            abs(s.module_pressures_psi.get(mid, 0.0) - final) < self.TOL_PRESSURE_PSI
+            for mid, final in self._inflation_final.items()
         )
         if length_converged or pressure_converged:
             self._phase_start = time.monotonic()
@@ -176,9 +243,6 @@ class ExperimentController:
                 target_roll = self._theta_target * math.sin(self._phi_target)
                 self.backend.set_orientation_target(target_pitch, target_roll, 0.0)
             self.state = State.BENDING
-            return
-        if elapsed > self.ELONGATION_TIMEOUT_S:
-            self._finish(timed_out=True)
 
     def _finish(self, timed_out: bool) -> None:
         elapsed = time.monotonic() - self._phase_start
@@ -204,15 +268,14 @@ class ExperimentController:
             elapsed_s=elapsed,
             timed_out=timed_out,
         )
+        # Freeze pressures at their current readings so the firmware PID
+        # stops driving toward the length-phase setpoint (which would
+        # otherwise keep the steppers pumping past the reached pose).
+        self._hold_pressures_at_current()
         self.state = State.TIMED_OUT if timed_out else State.REACHED
 
     def _tick_bending(self) -> None:
         s = self.backend.read_state()
-        # Live-mode IMU-staleness watchdog (spec §8). SimBackend reports fresh.
-        if not self.backend.is_sim and not s.imu_fresh:
-            self.emergency_stop()
-            return
-        elapsed = time.monotonic() - self._phase_start
         pitch, roll, _yaw = self.backend.read_orientation()
 
         target_pitch = self._theta_target * math.cos(self._phi_target)
@@ -238,13 +301,6 @@ class ExperimentController:
                 for sid in (1, 2, 3, 4):
                     self.backend.set_tendon_rate(sid, 0.0)
             self._finish(timed_out=False)
-            return
-
-        if elapsed > self.BEND_TIMEOUT_S:
-            if self._servo_defaults is None:
-                for sid in (1, 2, 3, 4):
-                    self.backend.set_tendon_rate(sid, 0.0)
-            self._finish(timed_out=True)
             return
 
         # Angle-control path handles bend writes in _update_tendon_angles().
@@ -283,19 +339,26 @@ class ExperimentController:
         self.backend.capture_zero()
         return True
 
-    def _command_module_pressures_for_length(self, L_total: float) -> None:
-        """Command every non-excluded module to the operator pressure ceiling.
+    def _compute_module_pressure_targets(self, L_total: float) -> Dict[int, float]:
+        """Return the final {module_id: psi} targets for a reach of L_total mm.
 
         The controller treats pressure as stiffness (bending comes from tendons),
-        so all active modules inflate to the same target during ELONGATING. If
+        so all active modules inflate to the same length during ELONGATING. If
         per-module calibration is present, solve its quadratic for the target
-        arc length instead; otherwise default to the ceiling.
+        arc length. Otherwise, linearly interpolate between baseline (at L_rest)
+        and the operator's safety ceiling (at L_max) based on L_total — so a
+        tiny reach commands a small pressure, not full ceiling inflation.
         """
         if self.cal.modules:
             active_ids = [mid for mid in self.cal.modules.keys() if mid not in self.EXCLUDED_MODULES]
         else:
             active_ids = [mid for mid in range(1, 7) if mid not in self.EXCLUDED_MODULES]
         per_module = L_total / max(1, len(active_ids))
+        L_rest = self.cal.L_rest
+        L_max = self.cal.L_max
+        span = L_max - L_rest
+        frac = max(0.0, min(1.0, (L_total - L_rest) / span)) if span > 0 else 0.0
+        targets: Dict[int, float] = {}
         for mid in active_ids:
             baseline = (self._psi_baseline or {}).get(mid, 0.0)
             if self.cal.modules and mid in self.cal.modules:
@@ -303,35 +366,100 @@ class ExperimentController:
                 a, b, c = m["coeffs"]
                 psi = _solve_psi_for_length(a, b, c, per_module, m["max_psi"])
             elif self._pressure_ceiling_psi is not None:
-                psi = self._pressure_ceiling_psi
+                psi = baseline + frac * (self._pressure_ceiling_psi - baseline)
             else:
                 psi = baseline
             psi = max(psi, baseline)
             if self._pressure_ceiling_psi is not None:
                 psi = min(psi, self._pressure_ceiling_psi)
-            self._pressure_setpoints[mid] = psi
-            self.backend.set_module_pressure(mid, psi)
+            targets[mid] = psi
+        return targets
+
+    def _advance_inflation_ramp(self, dt: float) -> None:
+        """Walk all modules' commanded pressures toward their finals together.
+
+        Each module's commanded psi = baseline + progress × (final − baseline),
+        where `progress` is a single shared [0, 1] scalar that rises at
+        INFLATION_RATE_PER_S. The ramp is open-loop on purpose — gating on
+        actual pressure caused the frontier to stall for ~20 s at startup
+        when firmware PID deadband filtered out the initial tiny ramp deltas.
+        The firmware PID still hunts each module independently; the ramp
+        just keeps their setpoints in lockstep and their slack in lockstep.
+        """
+        if not self._inflation_final or self._inflation_progress >= 1.0:
+            return
+        baseline = self._psi_baseline or {}
+        self._inflation_progress = min(
+            1.0, self._inflation_progress + self.INFLATION_RATE_PER_S * dt
+        )
+        for mid, final in self._inflation_final.items():
+            base = baseline.get(mid, 0.0)
+            commanded = base + self._inflation_progress * (final - base)
+            self._pressure_setpoints[mid] = commanded
+            self.backend.set_module_pressure(mid, commanded)
+
+    def _hold_pressures_at_current(self) -> None:
+        """Freeze each module's setpoint at its present reading so the firmware
+        PID holds position instead of continuing to drive toward the last
+        commanded (length-target) setpoint once the pose is reached."""
+        pressures = self.backend.read_state().module_pressures_psi
+        for mid, last_sp in list(self._pressure_setpoints.items()):
+            cur = pressures.get(mid, last_sp)
+            self._pressure_setpoints[mid] = cur
+            self.backend.set_module_pressure(mid, cur)
 
     # --- Angle-control path -----------------------------------------------
 
-    def _compute_slack_deg(self) -> float:
-        """Common-mode tendon slack (negative = pay out) from aggregate Δpsi.
+    def _current_length_estimate_mm(self) -> float:
+        """Return total arm length estimate in mm.
 
-        Slack = −Σ max(0, psi_m − baseline_m) × (10 / 0.3) degrees, summed
-        over non-excluded modules. Clamped to [−SLACK_MAX_DEG, 0]. Symmetric
-        deflation returns to 0 naturally via the max(0, …) floor and the
-        instantaneous pressure reading.
+        Live path (servo_defaults latched): derive from commanded slack —
+        ΔL_arm = −slack_deg × π/180 × PULLEY_RADIUS_MM. Drift-free and
+        IMU-free.
+
+        Fallback (no servo defaults, e.g. sim/tests): read whatever the
+        backend reports in BackendState.total_length_mm.
+        """
+        if self._servo_defaults is None:
+            return self.backend.read_state().total_length_mm
+        slack_deg = self._compute_slack_deg()
+        elongation_mm = -math.radians(slack_deg) * self.PULLEY_RADIUS_MM
+        return self.cal.L_rest + elongation_mm
+
+    def current_slack_deg(self) -> float:
+        """Public read of the current common-mode slack (degrees)."""
+        return self._compute_slack_deg()
+
+    def pressure_sum_delta_psi(self) -> float:
+        """Σ max(0, psi_m − baseline_m) across modules, in psi.
+
+        Proxy for how much inflation energy is in the arm right now. Useful
+        for correlating camera-measured physical z against sensor state
+        when no per-module length calibration is available.
         """
         if self._psi_baseline is None:
             return 0.0
         pressures = self.backend.read_state().module_pressures_psi
-        sum_delta = 0.0
+        total = 0.0
         for mid, base in self._psi_baseline.items():
             cur = pressures.get(mid, base)
-            sum_delta += max(0.0, cur - base)
-        slack = -sum_delta * self.SLACK_PER_PSI
-        # Never over-tension past defaults; never exceed safety clamp.
-        return max(-self.SLACK_MAX_DEG, min(0.0, slack))
+            total += max(0.0, cur - base)
+        return total
+
+    def _compute_slack_deg(self) -> float:
+        """Common-mode tendon slack (negative = pay out), driven by the
+        synchronized inflation ramp progress.
+
+        Slack = −SLACK_MAX_DEG × progress. Monotonic by construction:
+        progress only ever increases during ELONGATING, so slack only
+        becomes more negative. This replaces the previous sensor-driven
+        formulation, which oscillated (and occasionally wound the servos
+        UP) as noisy per-module pressure readings moved the aggregate
+        Δpsi sum around. All 4 tendon servos share this one scalar, so
+        they unwind together at the same rate regardless of their per-
+        servo default angles.
+        """
+        return -self.SLACK_MAX_DEG * self._inflation_progress
 
     def _compute_bend_offsets_deg(self) -> Dict[int, float]:
         """Differential-mode P-controller offsets (degrees) per tendon.
