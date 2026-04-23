@@ -527,27 +527,17 @@ class ArmUI:
         self.experiment_panel.set_status("Zeroing — confirm trunk is at rest, then Confirm Zero")
 
     def _exp_confirm_zero(self):
-        from experiment_controller import ExperimentController
-        # In BASIC sub-mode, force the burst-panel sliders to the calibrated
-        # Basic-mode servo start angles, physically move the servos there,
-        # and latch those as the controller's _servo_defaults. In COMPLEX
-        # mode, snapshot whatever the operator has the sliders at.
-        if self.experiment_panel.current_submode() == "BASIC":
-            servo_defaults = dict(ExperimentController.BASIC_SERVO_DEFAULTS)
-            try:
-                for sid, angle in servo_defaults.items():
-                    self.burst_panel._servo_vars[sid - 1].set(int(angle))
-                    self.experiment_backend.set_tendon_angle(sid, float(angle))
-            except (AttributeError, IndexError):
-                pass
-        else:
-            try:
-                servo_defaults = {
-                    sid: int(self.burst_panel._servo_vars[sid - 1].get())
-                    for sid in (1, 2, 3, 4)
-                }
-            except (AttributeError, IndexError):
-                servo_defaults = None
+        # Snapshot whatever the burst-panel sliders currently show. Both
+        # sub-modes latch the captured angles as the controller's
+        # _servo_defaults — Confirm Zero must never move the servos, or
+        # it'd clobber the operator's calibrated rest pose.
+        try:
+            servo_defaults = {
+                sid: int(self.burst_panel._servo_vars[sid - 1].get())
+                for sid in (1, 2, 3, 4)
+            }
+        except (AttributeError, IndexError):
+            servo_defaults = None
         self.experiment_controller.confirm_zero(servo_defaults=servo_defaults)
         self.experiment_panel.set_status("Zero captured — pick a target")
 

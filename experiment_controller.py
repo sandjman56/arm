@@ -58,15 +58,6 @@ class ExperimentController:
     # Basic Elongation sub-mode tuning.
     BASIC_UNWIND_KP_DEG_PER_S_PER_PSI = 10.0   # unwind rate per psi of overshoot
     BASIC_UNWIND_MAX_DEG_PER_S = 30.0           # clamp on unwind rate
-    # Servo starting angles for Basic elongation runs. These are the rest
-    # angles the operator has calibrated the rig to; the unwind P-controller
-    # composes slack (always negative) on top.
-    BASIC_SERVO_DEFAULTS: Dict[int, float] = {
-        1: -100.0,  # Servo A (pin 9)
-        2: 14.0,    # Servo B (pin 10)
-        3: 192.0,   # Servo C (pin 11)
-        4: 292.0,   # Servo D (pin 24)
-    }
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
