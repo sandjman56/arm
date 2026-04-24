@@ -20,7 +20,7 @@ class BurstPanel(tk.Frame):
 
         # One IntVar per servo (A/B/C/D -> pins 9/10/11/24). Sliders are
         # UI-only; angles are not sent to the firmware until Save is pressed.
-        self._servo_defaults = (0, 14, 192, 292)
+        self._servo_defaults = (-21, 22, 135, 208)
         self._servo_vars = [tk.IntVar(value=v) for v in self._servo_defaults]
 
         self._build()
