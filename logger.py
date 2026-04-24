@@ -26,6 +26,10 @@ class CSVLogger:
         "pitch_deg", "roll_deg", "yaw_deg",
         "phase",
         "slack_deg", "p_sum_delta_psi",
+        # Extended fields appended (evaluation panel reads by column name,
+        # so extra columns are ignored by older readers).
+        "p6",
+        "pos1", "pos2", "pos3", "pos4", "pos5", "pos6",
     ]
 
     def start(self, prefix="log"):
