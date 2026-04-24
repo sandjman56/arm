@@ -447,6 +447,10 @@ class ArmUI:
                 threading.Thread(target=self.reader, daemon=True).start()
                 self.root.after(500, self.load_calibration)
                 self.root.after(600, self._push_servo_defaults)
+                # Promote experiment backend to LiveBackend immediately so
+                # PM/IMU telemetry is ingested in any UI mode (burst logs
+                # need real pressure/orientation, not the idle sim zeros).
+                self.root.after(700, self._refresh_experiment_backend)
             else:
                 self.connection.set("Not connected")
                 self.status.set("CONNECTION FAILED")
@@ -1274,7 +1278,22 @@ class ArmUI:
         """
         import math as _m
         s = self.experiment_backend.read_state()
-        pressures = s.module_pressures_psi
+
+        # Pressures: read directly from each module's live StringVar (updated
+        # from every PM, serial line in update_loop). This is the source of
+        # truth regardless of which experiment backend is active — in burst
+        # mode the experiment_backend may be SimBackend (all zeros) until
+        # connect, and even after, this path is simpler and can't get stale.
+        def _press(mid):
+            for mod in self.modules:
+                if mod["id"] == mid:
+                    v = mod["pressure_psi"].get()
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return ""
+            return ""
+        pressures = {mid: _press(mid) for mid in (1, 2, 3, 4, 5, 6)}
 
         def _imu(k):
             v = self.imu_data[k].get()
