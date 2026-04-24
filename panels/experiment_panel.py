@@ -44,6 +44,7 @@ class ExperimentPanel(tk.Frame):
         on_reach,
         on_reach_basic,
         on_emergency_stop,
+        on_reach_bending=None,
         **kwargs,
     ):
         super().__init__(parent, bg=BG_PANEL, **kwargs)
@@ -52,6 +53,7 @@ class ExperimentPanel(tk.Frame):
         self._on_rezero = on_rezero
         self._on_reach = on_reach
         self._on_reach_basic = on_reach_basic
+        self._on_reach_bending = on_reach_bending
         self._on_emergency_stop = on_emergency_stop
 
         # StringVars so the update loop can push values in.
@@ -76,6 +78,18 @@ class ExperimentPanel(tk.Frame):
         self.basic_elongation_readout_var = tk.StringVar(value="Elongation: 0.0 / 0.0 mm")
         self.basic_slack_readout_var = tk.StringVar(value="Slack: 0.0 deg")
         self.basic_maxpsi_readout_var = tk.StringVar(value="Max psi: 0.0")
+
+        # Bending sub-mode state.
+        self.bend_theta_var = tk.StringVar(value="20.0")
+        self.bend_dir_var = tk.StringVar(value="+X")
+        self.bend_ramp_var = tk.StringVar(value="5.0")
+        self.bend_hold_var = tk.StringVar(value="5.0")
+        self.bend_loop_var = tk.StringVar(value="OPEN")  # OPEN / CLOSED
+        self.bend_pre_psi_vars = {
+            mid: tk.StringVar(value="0.0") for mid in (1, 2, 3, 4, 5, 6)
+        }
+        self.bend_theta_readout_var = tk.StringVar(value="IMU θ: 0.0°")
+        self.bend_pull_readout_var = tk.StringVar(value="Pull: 0.0°")
 
         # Current workspace for coordinate-frame conversions when updating the
         # 3D preview (physics-frame). Kept in sync by set_workspace().
@@ -115,7 +129,7 @@ class ExperimentPanel(tk.Frame):
             selectcolor=BG_PANEL, activebackground=BG_PANEL,
         ).pack(side="left", padx=(8, 0))
         tk.Radiobutton(
-            mode_row, text="Complex", variable=self.submode_var, value="COMPLEX",
+            mode_row, text="Bending", variable=self.submode_var, value="BENDING",
             command=self._on_submode_change,
             font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
             selectcolor=BG_PANEL, activebackground=BG_PANEL,
@@ -215,12 +229,13 @@ class ExperimentPanel(tk.Frame):
             tk.Label(basic_readouts, textvariable=var, font=FONT_BODY,
                      fg=TEXT_PRIMARY, bg=BG_PANEL).pack(anchor="w")
 
-        # --- 3b. Canvas row (Complex mode) fills whatever is left --------
+        # --- 3b. Canvas row (legacy Complex preview) ---------------------
+        # Retained for tip-position readouts / reach markers during live
+        # telemetry; no UI submode surfaces it anymore.
         from panels.experiment_pickers import XYPicker, XZPicker
         from panels.experiment_preview import TrunkPreview3D
 
         self.canvas_row = tk.Frame(self, bg=BG_PANEL)
-        # Intentionally NOT packed here; _on_submode_change handles visibility.
         self.xy_picker = XYPicker(self.canvas_row, r_max=400.0)
         self.xy_picker.pack(side="left", padx=4, fill="both", expand=True)
         self.xy_picker.bind_pick(self._on_xy_pick)
@@ -230,20 +245,121 @@ class ExperimentPanel(tk.Frame):
         self.preview3d = TrunkPreview3D(self.canvas_row, L_max=480.0)
         self.preview3d.pack(side="left", padx=4, fill="both", expand=True)
 
-        # Default to BASIC: pack basic_body, hide canvas_row.
+        # --- 3c. Bending body frame (shown when sub-mode == BENDING) ------
+        self.bend_body = tk.Frame(self, bg=BG_PANEL)
+        self._build_bend_body(self.bend_body)
+
+        # Default to BASIC: pack basic_body, hide everything else.
         self._on_submode_change()
+
+    def _build_bend_body(self, parent: tk.Frame) -> None:
+        # Row 1: target angle + direction + mode + ramp/hold
+        row1 = tk.Frame(parent, bg=BG_PANEL)
+        row1.pack(fill="x", pady=(6, 2))
+        tk.Label(row1, text="θ target (deg):", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(row1, textvariable=self.bend_theta_var, width=6,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
+        tk.Label(row1, text="Direction:", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        for d in ("+X", "-X", "+Y", "-Y"):
+            tk.Radiobutton(
+                row1, text=d, variable=self.bend_dir_var, value=d,
+                font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
+                selectcolor=BG_PANEL, activebackground=BG_PANEL,
+            ).pack(side="left", padx=(4, 0))
+
+        row2 = tk.Frame(parent, bg=BG_PANEL)
+        row2.pack(fill="x", pady=2)
+        tk.Label(row2, text="Ramp (s):", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(row2, textvariable=self.bend_ramp_var, width=5,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
+        tk.Label(row2, text="Hold (s):", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Entry(row2, textvariable=self.bend_hold_var, width=5,
+                 font=FONT_DATA).pack(side="left", padx=(4, 12))
+        tk.Label(row2, text="Mode:", font=FONT_BODY,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+        tk.Radiobutton(
+            row2, text="Open-loop", variable=self.bend_loop_var, value="OPEN",
+            font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
+            selectcolor=BG_PANEL, activebackground=BG_PANEL,
+        ).pack(side="left", padx=(4, 0))
+        tk.Radiobutton(
+            row2, text="Closed-loop", variable=self.bend_loop_var, value="CLOSED",
+            font=FONT_BODY, fg=TEXT_PRIMARY, bg=BG_PANEL,
+            selectcolor=BG_PANEL, activebackground=BG_PANEL,
+        ).pack(side="left", padx=(4, 0))
+
+        # Row 3: per-module pre-pressures
+        row3 = tk.Frame(parent, bg=BG_PANEL)
+        row3.pack(fill="x", pady=(6, 2))
+        tk.Label(row3, text="Pre-pressure (psi) per module:", font=FONT_LABEL,
+                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(anchor="w")
+        row3b = tk.Frame(parent, bg=BG_PANEL)
+        row3b.pack(fill="x", pady=(0, 4))
+        for mid in (1, 2, 3, 4, 5, 6):
+            cell = tk.Frame(row3b, bg=BG_PANEL)
+            cell.pack(side="left", padx=(0, 8))
+            tk.Label(cell, text=f"M{mid}", font=FONT_LABEL,
+                     fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
+            tk.Entry(cell, textvariable=self.bend_pre_psi_vars[mid], width=5,
+                     font=FONT_DATA).pack(side="left", padx=(3, 0))
+
+        # Run button + readouts
+        row4 = tk.Frame(parent, bg=BG_PANEL)
+        row4.pack(fill="x", pady=(6, 2))
+        AccentButton(row4, text="Run Experiment", accent=ACCENT_GREEN,
+                     command=self._handle_reach_bending).pack(side="left", padx=(0, 12))
+        tk.Label(row4, textvariable=self.bend_theta_readout_var, font=FONT_BODY,
+                 fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="left", padx=(0, 16))
+        tk.Label(row4, textvariable=self.bend_pull_readout_var, font=FONT_BODY,
+                 fg=TEXT_PRIMARY, bg=BG_PANEL).pack(side="left")
 
     # ----------------------------------------------------------------------
     # Sub-mode / Basic handlers
     # ----------------------------------------------------------------------
     def _on_submode_change(self) -> None:
-        """Swap between Basic body frame and Complex canvas row."""
-        if self.submode_var.get() == "BASIC":
-            self.canvas_row.pack_forget()
+        """Swap between Basic body and Bending body."""
+        sub = self.submode_var.get()
+        self.canvas_row.pack_forget()
+        self.basic_body.pack_forget()
+        self.bend_body.pack_forget()
+        if sub == "BASIC":
             self.basic_body.pack(fill="both", expand=True, padx=10, pady=4, side="top")
-        else:
-            self.basic_body.pack_forget()
-            self.canvas_row.pack(fill="both", expand=True, padx=10, pady=4, side="top")
+        elif sub == "BENDING":
+            self.bend_body.pack(fill="both", expand=True, padx=10, pady=4, side="top")
+
+    def _handle_reach_bending(self) -> None:
+        if self._on_reach_bending is None:
+            self.status_var.set("Bending runs not wired up")
+            return
+        try:
+            theta = float(self.bend_theta_var.get())
+            ramp_s = float(self.bend_ramp_var.get())
+            hold_s = float(self.bend_hold_var.get())
+            pre_psi = {
+                mid: float(self.bend_pre_psi_vars[mid].get())
+                for mid in (1, 2, 3, 4, 5, 6)
+            }
+        except ValueError:
+            self.status_var.set("Invalid bending input - check numeric fields")
+            return
+        direction = self.bend_dir_var.get()
+        closed_loop = self.bend_loop_var.get() == "CLOSED"
+        self._on_reach_bending(
+            theta_deg=theta,
+            direction=direction,
+            pre_pressures_psi=pre_psi,
+            ramp_s=ramp_s,
+            hold_s=hold_s,
+            closed_loop=closed_loop,
+        )
+
+    def set_bending_readouts(self, theta_imu_deg: float, pull_deg: float) -> None:
+        self.bend_theta_readout_var.set(f"IMU θ: {theta_imu_deg:.1f}°")
+        self.bend_pull_readout_var.set(f"Pull: {pull_deg:.1f}°")
 
     def _handle_reach_basic(self) -> None:
         try:

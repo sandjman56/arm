@@ -19,11 +19,27 @@ class State(enum.Enum):
     RETRACTING = "RETRACTING"
     REACHED = "REACHED"
     TIMED_OUT = "TIMED_OUT"
+    # Bending-mode phases (Bending experiment, separate from COMPLEX's BENDING).
+    BEND_PRESSURIZE = "BEND_PRESSURIZE"
+    BEND_RAMP = "BEND_RAMP"
+    BEND_HOLD = "BEND_HOLD"
+    BEND_RETURN = "BEND_RETURN"
 
 
 class ExperimentMode(enum.Enum):
     COMPLEX = "COMPLEX"
     BASIC_ELONGATION = "BASIC_ELONGATION"
+    BENDING = "BENDING"
+
+
+# Direction → (pulling servo id, opposite servo id). Servo map (from
+# _tick_bending in this file): 1=+pitch, 3=-pitch, 2=+roll, 4=-roll.
+BEND_DIRECTIONS: Dict[str, Tuple[int, int]] = {
+    "+X": (1, 3),
+    "-X": (3, 1),
+    "+Y": (2, 4),
+    "-Y": (4, 2),
+}
 
 
 @dataclass
@@ -73,6 +89,35 @@ class ExperimentController:
     # clear visual indicator in the UI. The firmware holds its last commanded
     # position during the hold (no servo/pressure rewrites).
     BASIC_REACHED_HOLD_S = 0.5
+    # --- Bending-mode constants -----------------------------------------
+    # Open-loop gain from commanded bend angle (rad) to servo pull (deg).
+    # 30 deg/rad matches the Complex-mode differential P-controller gain,
+    # so a full 45 deg bend = ~23.6 deg of servo pull on one side (and
+    # the opposite unwinds by the same magnitude — antagonistic symmetry).
+    BEND_DEG_PER_RAD = 30.0
+    # Hard cap on commanded tilt (degrees from vertical). UI can reject
+    # above this; firmware-side clamp enforces it regardless.
+    BEND_THETA_MAX_DEG = 45.0
+    # Max servo step per 20 Hz tick during any bending phase, matching
+    # the basic-mode retract clamp pattern. Prevents a single tick from
+    # slamming the servos regardless of ramp math.
+    BEND_STEP_CLAMP_DEG = 3.0
+    # Duration of the pressurize phase (s). Reuses INFLATION_RATE_PER_S
+    # for the ramp itself; this is just the minimum dwell before BEND_RAMP
+    # begins. If any pre-pressure is non-zero this needs long enough for
+    # firmware PID to catch up.
+    BEND_PRESSURIZE_S = 4.0
+    # Closed-loop hold controller gain: servo pull (deg) per rad of
+    # theta error. Smaller than the open-loop gain — this is a trim,
+    # not a drive.
+    BEND_HOLD_KP_DEG_PER_RAD = 20.0
+    # Deadband in which the closed-loop controller stops trimming, to
+    # avoid chattering against pneumatic compliance.
+    BEND_HOLD_DEADBAND_RAD = math.radians(1.0)
+    # Abort threshold: if IMU theta and commanded-servo-geometry theta
+    # disagree by more than this during BEND_HOLD closed-loop, something
+    # is wrong (cable slip, IMU glitch, arm stuck). Soft-return.
+    BEND_DIVERGENCE_ABORT_RAD = math.radians(20.0)
 
     def __init__(self, backend: Backend, calibration: LengthCalibration):
         self.backend = backend
@@ -105,6 +150,21 @@ class ExperimentController:
         self._basic_elongation_mm: float = 0.0
         self._basic_retract_elapsed_s: float = 0.0
         self._basic_reached_hold_elapsed_s: float = 0.0
+        # Bending-mode state. Populated by reach_bending(); reset on emergency
+        # stop and at the end of BEND_RETURN. `_bend_pull_deg` is the current
+        # commanded pull magnitude on the active antagonistic pair — each tick
+        # advances it toward `_bend_pull_target_deg`, clamped by
+        # BEND_STEP_CLAMP_DEG. Symmetric: pulling servo gets +pull, opposite
+        # gets -pull. See BEND_DIRECTIONS for the pair mapping.
+        self._bend_direction: Optional[str] = None
+        self._bend_target_theta_rad: float = 0.0
+        self._bend_pull_target_deg: float = 0.0
+        self._bend_pull_deg: float = 0.0
+        self._bend_ramp_s: float = 5.0
+        self._bend_hold_s: float = 5.0
+        self._bend_closed_loop: bool = False
+        self._bend_phase_elapsed_s: float = 0.0
+        self._bend_pre_pressures_psi: Dict[int, float] = {}
 
     # --- Transitions -------------------------------------------------------
 
@@ -135,6 +195,11 @@ class ExperimentController:
         # Drop the inflation ramp; next reach() rebuilds it from baseline.
         self._inflation_final = {}
         self._inflation_progress = 0.0
+        # Reset bending run state so a re-armed session starts clean.
+        self._bend_direction = None
+        self._bend_pull_deg = 0.0
+        self._bend_pull_target_deg = 0.0
+        self._bend_phase_elapsed_s = 0.0
 
     @property
     def last_result(self) -> Optional[RunResult]:
@@ -248,6 +313,68 @@ class ExperimentController:
         self._phase_start = time.monotonic()
         self.state = State.ELONGATING
 
+    def reach_bending(
+        self,
+        target_theta_deg: float,
+        direction: str,
+        pre_pressures_psi: Dict[int, float],
+        ramp_s: float = 5.0,
+        hold_s: float = 5.0,
+        closed_loop: bool = False,
+    ) -> None:
+        """Begin a Bending experiment run.
+
+        Pre-pressures are set per module (stiffness profile), then the
+        active antagonistic servo pair ramps toward the pull angle
+        corresponding to `target_theta_deg` over `ramp_s`, holds for
+        `hold_s`, and returns to neutral over `ramp_s`.
+        """
+        if self.mode != ExperimentMode.BENDING:
+            raise ValueError("reach_bending requires BENDING mode")
+        if self.state not in (State.WAITING_FOR_TARGET, State.REACHED, State.TIMED_OUT):
+            raise ValueError(
+                f"not ready to Reach (state={self.state.value}). "
+                "Press Zero @ Rest -> Confirm Zero first."
+            )
+        if self._servo_defaults is None:
+            raise ValueError(
+                "servo defaults not latched - press Confirm Zero with servo angles first"
+            )
+        if direction not in BEND_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {sorted(BEND_DIRECTIONS)}, got {direction!r}"
+            )
+        if ramp_s <= 0 or hold_s < 0:
+            raise ValueError(f"ramp_s must be >0 and hold_s >=0, got {ramp_s}/{hold_s}")
+        theta = max(0.0, min(self.BEND_THETA_MAX_DEG, float(target_theta_deg)))
+        self._bend_direction = direction
+        self._bend_target_theta_rad = math.radians(theta)
+        self._bend_pull_target_deg = self.BEND_DEG_PER_RAD * self._bend_target_theta_rad
+        self._bend_pull_deg = 0.0
+        self._bend_ramp_s = float(ramp_s)
+        self._bend_hold_s = float(hold_s)
+        self._bend_closed_loop = bool(closed_loop)
+        self._bend_pre_pressures_psi = {
+            int(mid): float(psi) for mid, psi in pre_pressures_psi.items()
+        }
+        # Arm the synchronized inflation ramp using the pre-pressures as the
+        # final target and the latched baseline as the starting point.
+        self._inflation_final = dict(self._bend_pre_pressures_psi)
+        self._inflation_progress = 0.0
+        self._pressure_setpoints = {}
+        baseline = self._psi_baseline or {}
+        for mid, final in self._inflation_final.items():
+            base = baseline.get(mid, 0.0)
+            self._pressure_setpoints[mid] = base
+            self.backend.set_module_pressure(mid, base)
+        # Emit the current (neutral) tendon angles so the first few ticks
+        # don't write stale values.
+        for sid in (1, 2, 3, 4):
+            self.last_tendon_angles[sid] = self._servo_defaults.get(sid, 0.0)
+        self._bend_phase_elapsed_s = 0.0
+        self._phase_start = time.monotonic()
+        self.state = State.BEND_PRESSURIZE
+
     # --- Main tick ---------------------------------------------------------
 
     _ACTIVE_STATES = frozenset({State.ELONGATING, State.BENDING, State.REACHED})
@@ -255,7 +382,8 @@ class ExperimentController:
     # inflation the tip can swing visibly and the IMU is noisy enough that
     # `imu_fresh` false positives would E-stop healthy runs. Length comes
     # from the tendon-servo angles + pulley geometry in that phase, so the
-    # IMU isn't load-bearing until BENDING.
+    # IMU isn't load-bearing until BENDING. BEND_HOLD with closed_loop is
+    # added below dynamically (only then does the IMU drive behavior).
     _IMU_WATCHDOG_STATES = frozenset({State.BENDING, State.REACHED})
 
     def tick(self, dt: float) -> None:
@@ -287,6 +415,14 @@ class ExperimentController:
             self._tick_basic_reached_hold(dt)
         elif self.state == State.BENDING:
             self._tick_bending()
+        elif self.state == State.BEND_PRESSURIZE:
+            self._tick_bend_pressurize(dt)
+        elif self.state == State.BEND_RAMP:
+            self._tick_bend_ramp(dt)
+        elif self.state == State.BEND_HOLD:
+            self._tick_bend_hold(dt)
+        elif self.state == State.BEND_RETURN:
+            self._tick_bend_return(dt)
 
         # Complex-mode angle-control path. Basic mode writes its own angles in
         # _tick_basic_elongating() and must not double-write via
@@ -514,6 +650,149 @@ class ExperimentController:
             self.backend.set_tendon_rate(2, rate_2)
             self.backend.set_tendon_rate(3, rate_3)
             self.backend.set_tendon_rate(4, rate_4)
+
+    # --- Bending-mode ticks ------------------------------------------------
+
+    def _bend_write_tendons(self) -> None:
+        """Write antagonistic servo commands from `_bend_pull_deg`.
+
+        The pulling servo moves to (default + pull); the opposite moves to
+        (default - pull) — equal magnitudes, opposite signs, so the cable
+        budget on that axis is conserved and the antagonist never fights.
+        Non-active servos stay at their latched defaults.
+        """
+        if self._servo_defaults is None or self._bend_direction is None:
+            return
+        puller, opposite = BEND_DIRECTIONS[self._bend_direction]
+        pull = self._bend_pull_deg
+        for sid in (1, 2, 3, 4):
+            default = self._servo_defaults.get(sid, 0.0)
+            if sid == puller:
+                angle = default + pull
+            elif sid == opposite:
+                angle = default - pull
+            else:
+                angle = default
+            self.last_tendon_angles[sid] = angle
+            self.backend.set_tendon_angle(sid, angle)
+
+    def _bend_step_pull_toward(self, target_deg: float, max_step_deg: float) -> None:
+        """Advance `_bend_pull_deg` toward target, clamped per tick."""
+        step_cap = min(max_step_deg, self.BEND_STEP_CLAMP_DEG)
+        delta = target_deg - self._bend_pull_deg
+        if abs(delta) <= step_cap:
+            self._bend_pull_deg = target_deg
+        else:
+            self._bend_pull_deg += math.copysign(step_cap, delta)
+
+    def _tick_bend_pressurize(self, dt: float) -> None:
+        """Advance the pre-pressure ramp; transition to BEND_RAMP once the
+        ramp completes and a minimum dwell has elapsed."""
+        self._advance_inflation_ramp(dt)
+        self._bend_phase_elapsed_s += dt
+        # Keep servos at neutral during pressurize.
+        self._bend_write_tendons()
+        ready = (
+            self._inflation_progress >= 1.0
+            and self._bend_phase_elapsed_s >= self.BEND_PRESSURIZE_S
+        )
+        if ready:
+            self._bend_phase_elapsed_s = 0.0
+            self._phase_start = time.monotonic()
+            self.state = State.BEND_RAMP
+
+    def _tick_bend_ramp(self, dt: float) -> None:
+        self._bend_phase_elapsed_s += dt
+        frac = min(1.0, self._bend_phase_elapsed_s / max(self._bend_ramp_s, 1e-6))
+        target = frac * self._bend_pull_target_deg
+        # Per-tick ramp step derived from linear ramp rate; final clamp
+        # is BEND_STEP_CLAMP_DEG regardless.
+        ramp_rate_deg_per_s = self._bend_pull_target_deg / max(self._bend_ramp_s, 1e-6)
+        max_step = abs(ramp_rate_deg_per_s) * dt + 1e-6
+        self._bend_step_pull_toward(target, max_step)
+        self._bend_write_tendons()
+        if frac >= 1.0 and abs(self._bend_pull_deg - self._bend_pull_target_deg) < 1e-3:
+            self._bend_phase_elapsed_s = 0.0
+            self._phase_start = time.monotonic()
+            self.state = State.BEND_HOLD
+
+    def _tick_bend_hold(self, dt: float) -> None:
+        self._bend_phase_elapsed_s += dt
+        if self._bend_closed_loop:
+            pitch, roll, _yaw = self.backend.read_orientation()
+            theta_imu = math.hypot(pitch, roll)
+            err = self._bend_target_theta_rad - theta_imu
+            # Divergence abort: if IMU disagrees with commanded geometry by
+            # more than the threshold, bail out via soft-return rather than
+            # keep trimming into a broken state.
+            commanded_theta = math.radians(self._bend_pull_deg / self.BEND_DEG_PER_RAD) \
+                if self.BEND_DEG_PER_RAD > 0 else 0.0
+            if abs(theta_imu - commanded_theta) > self.BEND_DIVERGENCE_ABORT_RAD:
+                self._begin_bend_return()
+                return
+            if abs(err) > self.BEND_HOLD_DEADBAND_RAD:
+                trim_target = (
+                    self._bend_pull_target_deg
+                    + self.BEND_HOLD_KP_DEG_PER_RAD * err
+                )
+                # Cap trim within ±BEND_THETA_MAX_DEG-equivalent pull.
+                max_pull = self.BEND_DEG_PER_RAD * math.radians(self.BEND_THETA_MAX_DEG)
+                trim_target = max(-max_pull, min(max_pull, trim_target))
+                self._bend_step_pull_toward(trim_target, self.BEND_STEP_CLAMP_DEG)
+        # Open-loop: servos park at the last commanded value. Write either
+        # way so the firmware doesn't see a stale-command gap.
+        self._bend_write_tendons()
+        if self._bend_phase_elapsed_s >= self._bend_hold_s:
+            self._begin_bend_return()
+
+    def _begin_bend_return(self) -> None:
+        self._bend_phase_elapsed_s = 0.0
+        self._phase_start = time.monotonic()
+        self.state = State.BEND_RETURN
+
+    def _tick_bend_return(self, dt: float) -> None:
+        self._bend_phase_elapsed_s += dt
+        frac = min(1.0, self._bend_phase_elapsed_s / max(self._bend_ramp_s, 1e-6))
+        # Ramp from whatever pull we're currently at toward 0.
+        target = (1.0 - frac) * self._bend_pull_target_deg
+        # Sign-preserving: if we drifted past target in closed-loop, still
+        # walk monotonically to zero.
+        if abs(self._bend_pull_target_deg) < 1e-9:
+            target = 0.0
+        ramp_rate_deg_per_s = abs(self._bend_pull_target_deg) / max(self._bend_ramp_s, 1e-6)
+        max_step = ramp_rate_deg_per_s * dt + 1e-6
+        self._bend_step_pull_toward(target, max_step)
+        self._bend_write_tendons()
+        done_geom = abs(self._bend_pull_deg) < 1e-3 and frac >= 1.0
+        if done_geom:
+            # Drop pre-pressures toward baseline so the next run starts clean.
+            baseline = self._psi_baseline or {}
+            for mid in list(self._pressure_setpoints.keys()):
+                target_psi = baseline.get(mid, 0.0)
+                self._pressure_setpoints[mid] = target_psi
+                self.backend.set_module_pressure(mid, target_psi)
+            elapsed = time.monotonic() - self._phase_start
+            self._last_result = RunResult(
+                final_pitch_err_rad=0.0,
+                final_position_err_mm=0.0,
+                elapsed_s=elapsed,
+                timed_out=False,
+            )
+            self.state = State.REACHED
+
+    def soft_stop_bending(self) -> bool:
+        """Graceful abort for bending experiments: transition to BEND_RETURN
+        so servos ramp to neutral at the step-clamp rate instead of the
+        aggressive backend-level STOP. Returns True if engaged.
+        """
+        if self.state in (
+            State.BEND_PRESSURIZE,
+            State.BEND_RAMP,
+            State.BEND_HOLD,
+        ):
+            self._begin_bend_return()
+            return True
+        return False
 
     # --- Re-zero guard -----------------------------------------------------
 

@@ -22,7 +22,10 @@ from widgets import (
 from arduino_interface import ArduinoInterface
 from logger import CSVLogger
 from graph import PressureGraph
-from panels import BurstPanel, PIDPanel, CalibrationPanel, ExperimentPanel, EvaluationPanel
+from panels import (
+    BurstPanel, PIDPanel, CalibrationPanel, ExperimentPanel, EvaluationPanel,
+    DiagnosticsPanel,
+)
 
 
 class ArmUI:
@@ -296,7 +299,8 @@ class ArmUI:
 
         for text, val in [("Burst Control", "burst"), ("PID Control", "pid"),
                           ("Calibration", "calibration"), ("Experiments", "experiments"),
-                          ("Evaluation", "evaluation")]:
+                          ("Evaluation", "evaluation"),
+                          ("Diagnostics", "diagnostics")]:
             rb = ttk.Radiobutton(mode_frame, text=text, variable=self.mode,
                                  value=val, command=self.switch_mode)
             rb.pack(side="left", padx=10)
@@ -349,6 +353,7 @@ class ArmUI:
             on_rezero=self._exp_rezero,
             on_reach=self._exp_reach,
             on_reach_basic=self._exp_reach_basic,
+            on_reach_bending=self._exp_reach_bending,
             on_emergency_stop=self._exp_emergency_stop,
         )
 
@@ -356,6 +361,14 @@ class ArmUI:
         self.evaluation_panel = EvaluationPanel(
             self.panel_container,
             logger_dir=self.logger.output_dir,
+        )
+
+        # Diagnostics mode: motor-induced IMU noise isolator.
+        self.diagnostics_panel = DiagnosticsPanel(
+            self.panel_container,
+            modules=self.modules,
+            on_send=self.send,
+            on_emergency_stop=self.emergency_stop,
         )
         # Rolling yaw history for drift estimation.
         self._yaw_history = deque(maxlen=600)  # ~60s at 10Hz
@@ -374,7 +387,7 @@ class ArmUI:
         log_btns = tk.Frame(log_frame, bg=BG_PRIMARY)
         log_btns.pack(pady=5)
         AccentButton(log_btns, text="Start Logging", accent=ACCENT_GREEN,
-                    command=self.start_log).pack(side="left", padx=5)
+                    command=self._start_log_prompt).pack(side="left", padx=5)
         AccentButton(log_btns, text="Stop Logging",
                     command=self.stop_log).pack(side="left", padx=5)
 
@@ -434,6 +447,10 @@ class ArmUI:
                 threading.Thread(target=self.reader, daemon=True).start()
                 self.root.after(500, self.load_calibration)
                 self.root.after(600, self._push_servo_defaults)
+                # Promote experiment backend to LiveBackend immediately so
+                # PM/IMU telemetry is ingested in any UI mode (burst logs
+                # need real pressure/orientation, not the idle sim zeros).
+                self.root.after(700, self._refresh_experiment_backend)
             else:
                 self.connection.set("Not connected")
                 self.status.set("CONNECTION FAILED")
@@ -456,6 +473,10 @@ class ArmUI:
             return False
         if self.arduino.send(cmd):
             self.status.set(f"SENT: {cmd}")
+            try:
+                self.diagnostics_panel.on_command(cmd)
+            except (AttributeError, Exception):
+                pass
             return True
         # Write failed — device was disconnected. Update UI state.
         self.connection.set("Not connected")
@@ -480,6 +501,7 @@ class ArmUI:
         self.cal_panel.pack_forget()
         self.experiment_panel.pack_forget()
         self.evaluation_panel.pack_forget()
+        self.diagnostics_panel.pack_forget()
 
         mode = self.mode.get()
         if mode == "burst":
@@ -511,6 +533,8 @@ class ArmUI:
             self.experiment_panel.pack(fill="both", expand=True)
         elif mode == "evaluation":
             self.evaluation_panel.pack(fill="both", expand=True)
+        elif mode == "diagnostics":
+            self.diagnostics_panel.pack(fill="both", expand=True)
 
     # ===========================
     # EXPERIMENTS
@@ -541,8 +565,11 @@ class ArmUI:
         # Sync controller mode to whatever the UI sub-mode shows, so the
         # Complex-mode angle-control tick doesn't run in a Basic session.
         from experiment_controller import ExperimentMode
-        if self.experiment_panel.current_submode() == "BASIC":
+        sub = self.experiment_panel.current_submode()
+        if sub == "BASIC":
             self.experiment_controller.mode = ExperimentMode.BASIC_ELONGATION
+        elif sub == "BENDING":
+            self.experiment_controller.mode = ExperimentMode.BENDING
         else:
             self.experiment_controller.mode = ExperimentMode.COMPLEX
         # Snapshot whatever the burst-panel sliders currently show. Both
@@ -646,7 +673,84 @@ class ArmUI:
         self._exp_prev_state = self.experiment_controller.state
         self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
 
+    def _exp_reach_bending(self, theta_deg: float, direction: str,
+                           pre_pressures_psi: dict, ramp_s: float,
+                           hold_s: float, closed_loop: bool):
+        from experiment_controller import ExperimentMode
+        self.experiment_controller.mode = ExperimentMode.BENDING
+        # Latch current servo slider values as defaults (same pattern as
+        # Complex/Basic reaches — bending composes pull offsets on top).
+        try:
+            servo_defaults = {
+                sid: int(self.burst_panel._servo_vars[sid - 1].get())
+                for sid in (1, 2, 3, 4)
+            }
+            self.experiment_controller._servo_defaults = servo_defaults
+        except (AttributeError, IndexError):
+            pass
+        try:
+            self.experiment_controller.reach_bending(
+                target_theta_deg=theta_deg,
+                direction=direction,
+                pre_pressures_psi=pre_pressures_psi,
+                ramp_s=ramp_s,
+                hold_s=hold_s,
+                closed_loop=closed_loop,
+            )
+        except ValueError as e:
+            self.experiment_panel.set_status(f"Rejected: {e}")
+            return
+        loop_tag = "CL" if closed_loop else "OL"
+        self.experiment_panel.set_status(
+            f"Bending {direction} θ={theta_deg:.1f}° ramp={ramp_s:.1f}s "
+            f"hold={hold_s:.1f}s [{loop_tag}]"
+        )
+        if not self.logger.is_active:
+            prefix = f"Bend_{direction.replace('+', 'p').replace('-', 'm')}_{int(round(theta_deg))}deg"
+            name = self.logger.start(prefix=prefix)
+            self._exp_auto_logging = True
+            self._write_bending_sidecar(name, theta_deg, direction,
+                                        pre_pressures_psi, ramp_s, hold_s,
+                                        closed_loop)
+        self._exp_prev_state = self.experiment_controller.state
+        self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
+
+    def _write_bending_sidecar(self, csv_name, theta_deg, direction,
+                               pre_pressures_psi, ramp_s, hold_s, closed_loop):
+        """Write a .json sidecar next to the CSV with the full run config.
+        `csv_name` may be None if the logger.start call failed."""
+        if not csv_name:
+            return
+        import json as _json
+        from datetime import datetime as _dt
+        meta = {
+            "run_type": "bending",
+            "started_at": _dt.now().isoformat(timespec="seconds"),
+            "target_theta_deg": theta_deg,
+            "direction": direction,
+            "pre_pressures_psi": pre_pressures_psi,
+            "ramp_s": ramp_s,
+            "hold_s": hold_s,
+            "closed_loop": closed_loop,
+        }
+        base = os.path.splitext(csv_name)[0]
+        path = os.path.join(self.logger.output_dir, base + ".json")
+        try:
+            with open(path, "w") as f:
+                _json.dump(meta, f, indent=2)
+        except Exception as e:
+            print(f"[WARN] sidecar write failed: {e}")
+
     def _exp_emergency_stop(self):
+        # If we're in a bending-run phase, prefer a soft return (ramp servos
+        # to neutral) over the hard backend STOP — instant servo moves can
+        # break cables under tension.
+        from experiment_controller import State as _ExpState
+        if self.experiment_controller.state in (
+            _ExpState.BEND_PRESSURIZE, _ExpState.BEND_RAMP, _ExpState.BEND_HOLD,
+        ) and self.experiment_controller.soft_stop_bending():
+            self.experiment_panel.set_status("Soft-stop: returning to neutral")
+            return
         self.experiment_controller.emergency_stop()
         self.experiment_panel.set_status("EMERGENCY STOP")
         self._exp_auto_log_stop()
@@ -890,11 +994,15 @@ class ArmUI:
             # Multi-module pressure: PM,module_id,time_ms,hPa,psi[,pos]
             if line.startswith("PM,"):
                 parts = line.split(",")
+                parsed_ok = False
+                mod_id = None
+                psi = None
                 if len(parts) >= 5:
                     try:
                         mod_id = int(parts[1])
                         hpa = float(parts[3])
                         psi = float(parts[4])
+                        parsed_ok = True
 
                         for mod in self.modules:
                             if mod["id"] == mod_id:
@@ -915,6 +1023,10 @@ class ArmUI:
                                 break
                     except (ValueError, IndexError):
                         pass
+                try:
+                    self.diagnostics_panel.on_pressure(line, mod_id, parsed_ok, psi)
+                except (AttributeError, Exception):
+                    pass
 
             # Per-module step position: POS,module_id,steps
             # Sent for every wired module regardless of pressure sensor
@@ -998,6 +1110,11 @@ class ArmUI:
         except Exception as e:
             print(f"[GRAPH ERROR] {e}")
 
+        try:
+            self.diagnostics_panel.tick()
+        except Exception as e:
+            print(f"[DIAG ERROR] {e}")
+
         # Advance experiment controller ~10Hz (matches update_loop cadence).
         try:
             self.experiment_controller.tick(dt=0.1)
@@ -1033,6 +1150,12 @@ class ArmUI:
                     slack_deg=self.experiment_controller._basic_slack_deg,
                     max_psi=max_psi,
                 )
+            elif self.experiment_panel.current_submode() == "BENDING":
+                theta_deg = _m.degrees(_m.hypot(s.pitch, s.roll))
+                self.experiment_panel.set_bending_readouts(
+                    theta_imu_deg=theta_deg,
+                    pull_deg=self.experiment_controller._bend_pull_deg,
+                )
             # Pass tip in display frame (picker rendering) and arc in physics
             # frame (preview rendering). Panel handles the frame split.
             arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
@@ -1045,33 +1168,17 @@ class ArmUI:
                 last = self._stepper_last_change.get(mid)
                 active = last is not None and (_now_act - last) < self.STEPPER_ACTIVE_WINDOW_S
                 self.experiment_panel.set_stepper_active(mid, active)
-            # Emit one log row per tick while logging is active.
-            if self.logger.is_active:
-                pressures = s.module_pressures_psi
-                angles = self.experiment_controller.last_tendon_angles
-                def _imu(k):
-                    v = self.imu_data[k].get()
-                    try:
-                        return float(v)
-                    except ValueError:
-                        return ""
-                self.logger.log([
-                    pressures.get(1, ""), pressures.get(2, ""),
-                    pressures.get(3, ""), pressures.get(4, ""), pressures.get(5, ""),
-                    _imu("ax"), _imu("ay"), _imu("az"),
-                    _imu("gx"), _imu("gy"), _imu("gz"),
-                    angles.get(1, ""), angles.get(2, ""),
-                    angles.get(3, ""), angles.get(4, ""),
-                    f"{_m.degrees(s.pitch):.3f}",
-                    f"{_m.degrees(s.roll):.3f}",
-                    f"{_m.degrees(s.yaw):.3f}",
-                    self.experiment_controller.state.value,
-                    f"{self.experiment_controller.current_slack_deg():.3f}",
-                    f"{self.experiment_controller.pressure_sum_delta_psi():.4f}",
-                ])
         except Exception as e:
             # Keep the main loop alive even if the experiment panel breaks.
             print(f"[WARN] experiment tick failed: {e}")
+
+        # Emit one log row per tick while logging is active. Runs regardless
+        # of which UI mode is active so burst/PID/calibration sessions log too.
+        if self.logger.is_active:
+            try:
+                self._write_log_row()
+            except Exception as e:
+                print(f"[WARN] log write failed: {e}")
 
         # Auto-stop experiment logging on (1) controller reached target,
         # (2) controller timed out, or (3) connection dropped mid-run.
@@ -1109,6 +1216,25 @@ class ArmUI:
         if name:
             self.status.set(f"LOGGING: {name}")
 
+    def _start_log_prompt(self):
+        """Prompt the user for a log name, then start logging. Cancel aborts."""
+        if self.logger.is_active:
+            self.status.set("LOGGING ALREADY ACTIVE")
+            return
+        from tkinter import simpledialog
+        default = f"{self.mode.get()}_log"
+        name = simpledialog.askstring(
+            "Start Logging",
+            "Log name (saved as <name>_YYYYMMDD_HHMMSS.csv):",
+            parent=self.root, initialvalue=default,
+        )
+        if name is None:
+            return
+        # Sanitize: strip path separators and whitespace; fall back to default.
+        import re as _re
+        safe = _re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip()) or default
+        self.start_log(prefix=safe)
+
     def stop_log(self):
         self.logger.stop()
         self.status.set("LOGGING STOPPED")
@@ -1133,6 +1259,84 @@ class ArmUI:
             self.logger.stop()
             self.status.set("LOGGING STOPPED")
         self.cal_panel.set_length_test_active(False)
+
+    def _write_log_row(self):
+        """Write one row of live sensor + motor data to the active log.
+
+        Sources:
+          pressures/IMU: experiment backend state (always current in live
+                        mode; ingests every PM/IMU line). In sim mode,
+                        these reflect the simulated state.
+          servos:       burst panel's current slider values (matches what's
+                        commanded in burst mode; also kept in sync during
+                        experiment runs because experiment writes update the
+                        UI sliders indirectly via the firmware acks).
+          positions:    each module's step_position IntVar (updated from
+                        PM,/POS, telemetry).
+          phase:        experiment controller state if active, otherwise
+                        the current UI mode (burst / pid / calibration / ...).
+        """
+        import math as _m
+        s = self.experiment_backend.read_state()
+
+        # Pressures: read directly from each module's live StringVar (updated
+        # from every PM, serial line in update_loop). This is the source of
+        # truth regardless of which experiment backend is active — in burst
+        # mode the experiment_backend may be SimBackend (all zeros) until
+        # connect, and even after, this path is simpler and can't get stale.
+        def _press(mid):
+            for mod in self.modules:
+                if mod["id"] == mid:
+                    v = mod["pressure_psi"].get()
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return ""
+            return ""
+        pressures = {mid: _press(mid) for mid in (1, 2, 3, 4, 5, 6)}
+
+        def _imu(k):
+            v = self.imu_data[k].get()
+            try:
+                return float(v)
+            except ValueError:
+                return ""
+
+        try:
+            sv = self.burst_panel.current_servo_angles()
+        except Exception:
+            sv = (0, 0, 0, 0)
+
+        positions = {}
+        for mod in self.modules:
+            try:
+                positions[mod["id"]] = int(mod["step_position"].get())
+            except Exception:
+                positions[mod["id"]] = ""
+
+        ctrl_state = self.experiment_controller.state
+        from experiment_controller import State as _St
+        if ctrl_state in (_St.IDLE,):
+            phase = self.mode.get().upper()
+        else:
+            phase = ctrl_state.value
+
+        self.logger.log([
+            pressures.get(1, ""), pressures.get(2, ""),
+            pressures.get(3, ""), pressures.get(4, ""), pressures.get(5, ""),
+            _imu("ax"), _imu("ay"), _imu("az"),
+            _imu("gx"), _imu("gy"), _imu("gz"),
+            sv[0], sv[1], sv[2], sv[3],
+            f"{_m.degrees(s.pitch):.3f}",
+            f"{_m.degrees(s.roll):.3f}",
+            f"{_m.degrees(s.yaw):.3f}",
+            phase,
+            f"{self.experiment_controller.current_slack_deg():.3f}",
+            f"{self.experiment_controller.pressure_sum_delta_psi():.4f}",
+            pressures.get(6, ""),
+            positions.get(1, ""), positions.get(2, ""), positions.get(3, ""),
+            positions.get(4, ""), positions.get(5, ""), positions.get(6, ""),
+        ])
 
     def _exp_auto_log_stop(self):
         """Stop logging only if we auto-started it for a reach."""
