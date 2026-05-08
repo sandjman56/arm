@@ -1,28 +1,7 @@
-"""Experiments-mode panel: target picking + two-phase reach controller.
-
-Layout is arranged so that the target-entry row, readouts, and E-stop
-button ALWAYS remain visible regardless of window height. The 3D preview
-canvas is the only element that shrinks when the window does. This is
-achieved by packing the always-visible rows from the bottom first, then
-packing the canvas row with expand=True in the middle.
-
-Picker interaction (spec §7 revision):
-  1. Click on XY picker                -> locks (X, Y). Red dot appears.
-                                          XZ picker gets a red dashed guide
-                                          line at the locked X with a red
-                                          draggable dot at a default Z.
-  2. Click or drag on XZ picker        -> Z snaps to the click/drag Y value
-                                          (X is snapped to locked X).
-  3. Any of (XY click, XZ drag, typed
-     text entry) refreshes the 3D
-     preview's target marker live.
-  4. Clicking XY again invalidates Z
-     (the red dot on XZ jumps back to
-     the default Z for the new X).
-"""
+"""Experiments-mode panel: Basic Elongation and Bending sub-modes."""
 from __future__ import annotations
 import tkinter as tk
-from typing import Optional, Tuple
+from typing import Optional
 
 from theme import (
     BG_PANEL, ACCENT_CYAN, ACCENT_CYAN_DIM, ACCENT_GREEN, ACCENT_ORANGE, ACCENT_RED,
@@ -41,7 +20,6 @@ class ExperimentPanel(tk.Frame):
         on_start_zero,
         on_confirm_zero,
         on_rezero,
-        on_reach,
         on_reach_basic,
         on_emergency_stop,
         on_reach_bending=None,
@@ -51,7 +29,6 @@ class ExperimentPanel(tk.Frame):
         self._on_start_zero = on_start_zero
         self._on_confirm_zero = on_confirm_zero
         self._on_rezero = on_rezero
-        self._on_reach = on_reach
         self._on_reach_basic = on_reach_basic
         self._on_reach_bending = on_reach_bending
         self._on_emergency_stop = on_emergency_stop
@@ -65,10 +42,6 @@ class ExperimentPanel(tk.Frame):
         self.yaw_drift_var = tk.StringVar(value="Yaw drift: 0.0°/min")
         self.phase_var = tk.StringVar(value="Phase: —")
         self.error_var = tk.StringVar(value="")
-
-        self.target_x = tk.StringVar(value="")
-        self.target_y = tk.StringVar(value="")
-        self.target_z = tk.StringVar(value="")
 
         # Basic sub-mode state.
         self.submode_var = tk.StringVar(value="BASIC")
@@ -91,21 +64,7 @@ class ExperimentPanel(tk.Frame):
         self.bend_theta_readout_var = tk.StringVar(value="IMU θ: 0.0°")
         self.bend_pull_readout_var = tk.StringVar(value="Pull: 0.0°")
 
-        # Current workspace for coordinate-frame conversions when updating the
-        # 3D preview (physics-frame). Kept in sync by set_workspace().
-        self._L_rest = 240.0
-        self._L_max = 480.0
-
-        # Guard flag so programmatic updates to target_* don't re-trigger the
-        # text-change trace (which itself updates the pickers and preview).
-        self._suppress_trace = False
-
         self._build()
-
-        # Text-field traces: user edits XYZ fields -> pickers and preview update.
-        self.target_x.trace_add("write", lambda *_: self._on_text_change())
-        self.target_y.trace_add("write", lambda *_: self._on_text_change())
-        self.target_z.trace_add("write", lambda *_: self._on_text_change())
 
     # ----------------------------------------------------------------------
     # Layout
@@ -117,7 +76,7 @@ class ExperimentPanel(tk.Frame):
                  fg=ACCENT_CYAN, bg=BG_PANEL).pack(anchor="w", padx=10, pady=(6, 0),
                                                    side="top")
 
-        # Sub-mode selector: Basic (scalar Z, no IMU) vs Complex (XYZ + bending).
+        # Sub-mode selector: Basic Elongation vs Bending.
         mode_row = tk.Frame(self, bg=BG_PANEL)
         mode_row.pack(fill="x", padx=10, pady=(4, 0), side="top")
         tk.Label(mode_row, text="Sub-mode:", font=FONT_LABEL,
@@ -151,7 +110,6 @@ class ExperimentPanel(tk.Frame):
         # --- 2. Always-visible bottom rows (pack from BOTTOM up) -----------
         # Order below is bottom-up: last thing packed here appears ABOVE the
         # items packed before it. So the visual stack (top -> bottom) ends up:
-        #   target entry
         #   readouts
         #   E-stop
         EmergencyStopButton(self, command=self._on_emergency_stop).pack(
@@ -189,18 +147,6 @@ class ExperimentPanel(tk.Frame):
             dot.pack(side="left", padx=(3, 0))
             self._stepper_dots[mid] = dot
 
-        tgt_row = tk.Frame(self, bg=BG_PANEL)
-        tgt_row.pack(fill="x", padx=10, pady=(4, 4), side="bottom")
-        tk.Label(tgt_row, text="Target:", font=FONT_BODY,
-                 fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left")
-        for label, var in (("X", self.target_x), ("Y", self.target_y), ("Z", self.target_z)):
-            tk.Label(tgt_row, text=label, font=FONT_BODY,
-                     fg=TEXT_SECONDARY, bg=BG_PANEL).pack(side="left", padx=(10, 2))
-            tk.Entry(tgt_row, textvariable=var, width=8,
-                     font=FONT_DATA).pack(side="left")
-        AccentButton(tgt_row, text="Reach", accent=ACCENT_GREEN,
-                     command=self._handle_reach).pack(side="left", padx=15)
-
         # --- 3a. Basic body frame (shown when sub-mode == BASIC) ----------
         self.basic_body = tk.Frame(self, bg=BG_PANEL)
 
@@ -229,23 +175,7 @@ class ExperimentPanel(tk.Frame):
             tk.Label(basic_readouts, textvariable=var, font=FONT_BODY,
                      fg=TEXT_PRIMARY, bg=BG_PANEL).pack(anchor="w")
 
-        # --- 3b. Canvas row (legacy Complex preview) ---------------------
-        # Retained for tip-position readouts / reach markers during live
-        # telemetry; no UI submode surfaces it anymore.
-        from panels.experiment_pickers import XYPicker, XZPicker
-        from panels.experiment_preview import TrunkPreview3D
-
-        self.canvas_row = tk.Frame(self, bg=BG_PANEL)
-        self.xy_picker = XYPicker(self.canvas_row, r_max=400.0)
-        self.xy_picker.pack(side="left", padx=4, fill="both", expand=True)
-        self.xy_picker.bind_pick(self._on_xy_pick)
-        self.xz_picker = XZPicker(self.canvas_row, L_rest=240.0, L_max=480.0)
-        self.xz_picker.pack(side="left", padx=4, fill="both", expand=True)
-        self.xz_picker.bind_pick(self._on_xz_pick)
-        self.preview3d = TrunkPreview3D(self.canvas_row, L_max=480.0)
-        self.preview3d.pack(side="left", padx=4, fill="both", expand=True)
-
-        # --- 3c. Bending body frame (shown when sub-mode == BENDING) ------
+        # --- 3b. Bending body frame (shown when sub-mode == BENDING) ------
         self.bend_body = tk.Frame(self, bg=BG_PANEL)
         self._build_bend_body(self.bend_body)
 
@@ -323,7 +253,6 @@ class ExperimentPanel(tk.Frame):
     def _on_submode_change(self) -> None:
         """Swap between Basic body and Bending body."""
         sub = self.submode_var.get()
-        self.canvas_row.pack_forget()
         self.basic_body.pack_forget()
         self.bend_body.pack_forget()
         if sub == "BASIC":
@@ -386,75 +315,6 @@ class ExperimentPanel(tk.Frame):
         return self.submode_var.get()
 
     # ----------------------------------------------------------------------
-    # Picker callbacks
-    # ----------------------------------------------------------------------
-    def _on_xy_pick(self, x: float, y: float) -> None:
-        """User clicked or dragged on XY. Locks (X, Y), invalidates Z."""
-        self._suppress_trace = True
-        try:
-            self.target_x.set(f"{x:.1f}")
-            self.target_y.set(f"{y:.1f}")
-            self.target_z.set("")
-        finally:
-            self._suppress_trace = False
-
-        self.xy_picker.set_target(x, y)
-        self.xz_picker.set_locked_x(x)
-        # Z is not set yet -> clear 3D preview target.
-        self.preview3d.set_target(None)
-
-    def _on_xz_pick(self, x: float, z: float) -> None:
-        """User clicked or dragged on XZ (only fires when XZ is gated open)."""
-        self._suppress_trace = True
-        try:
-            self.target_z.set(f"{z:.1f}")
-        finally:
-            self._suppress_trace = False
-        # X was already locked; nothing to update for xy_picker.
-        # Push the completed target into the 3D preview in physics frame.
-        self._update_preview_target_from_fields()
-
-    def _on_text_change(self) -> None:
-        """User edited one of the XYZ entry fields."""
-        if self._suppress_trace:
-            return
-        x = _parse_float(self.target_x.get())
-        y = _parse_float(self.target_y.get())
-        z = _parse_float(self.target_z.get())
-        # Mirror into pickers where possible.
-        if x is not None and y is not None:
-            self.xy_picker.set_target(x, y)
-            self.xz_picker.set_locked_x(x)
-        if x is not None and z is not None:
-            self.xz_picker.set_target(x, z)
-        # 3D preview.
-        self._update_preview_target_from_fields()
-
-    def _update_preview_target_from_fields(self) -> None:
-        x = _parse_float(self.target_x.get())
-        y = _parse_float(self.target_y.get())
-        z = _parse_float(self.target_z.get())
-        if x is None or y is None or z is None:
-            self.preview3d.set_target(None)
-            return
-        # 3D preview is rendered in physics frame — convert from display frame
-        # (resting-tip origin) by adding L_rest to z.
-        self.preview3d.set_target((x, y, z + self._L_rest))
-
-    # ----------------------------------------------------------------------
-    # Reach
-    # ----------------------------------------------------------------------
-    def _handle_reach(self) -> None:
-        try:
-            x = float(self.target_x.get())
-            y = float(self.target_y.get())
-            z = float(self.target_z.get())
-        except ValueError:
-            self.status_var.set("Invalid target — X/Y/Z must be numbers")
-            return
-        self._on_reach((x, y, z))
-
-    # ----------------------------------------------------------------------
     # Public setters (called by the controller/app update loop)
     # ----------------------------------------------------------------------
     def set_status(self, text: str) -> None:
@@ -490,9 +350,6 @@ class ExperimentPanel(tk.Frame):
                 self._phase_label.configure(
                     fg=TEXT_PRIMARY, bg=BG_PANEL, font=FONT_BODY,
                 )
-        self.xy_picker.set_reached(reached)
-        self.xz_picker.set_reached(reached)
-        self.preview3d.set_reached(reached)
 
     def set_stepper_active(self, module_id: int, active: bool) -> None:
         """Light/dim the activity dot for one module's stepper."""
@@ -503,51 +360,5 @@ class ExperimentPanel(tk.Frame):
         outline = ACCENT_GREEN if active else TEXT_SECONDARY
         dot.itemconfigure("dot", fill=fill, outline=outline)
 
-    def set_tip_position(self, tip_display: Tuple[float, float, float],
-                         arc_points_physics: list) -> None:
-        """Sync live-telemetry tip into the three canvases.
-
-        Args:
-            tip_display:        tip in DISPLAY frame (picker rendering)
-            arc_points_physics: arc samples in PHYSICS frame (preview rendering)
-        """
-        x, y, z_disp = tip_display
-        self.xy_picker.set_tip(x, y)
-        self.xz_picker.set_tip(x, z_disp)
-        # 3D preview is physics-frame: reconstruct tip_physics from arc points
-        # (the caller already built them consistently).
-        tip_physics = arc_points_physics[-1] if arc_points_physics else (x, y, z_disp + self._L_rest)
-        self.preview3d.set_tip_and_arc(tip_physics, arc_points_physics)
-
-    def set_target_marker(self, target_physics: Optional[Tuple[float, float, float]]) -> None:
-        """Draw a target marker in all three canvases from a PHYSICS-frame target.
-
-        Called from the app when `Reach` is pressed with a validated target.
-        Picker markers are drawn in display frame (subtract L_rest from z).
-        """
-        if target_physics is None:
-            self.xy_picker.set_target(None, None)
-            self.xz_picker.set_target(None, None)
-            self.preview3d.set_target(None)
-            return
-        tx, ty, tz = target_physics
-        tz_disp = tz - self._L_rest
-        self.xy_picker.set_target(tx, ty)
-        self.xz_picker.set_target(tx, tz_disp)
-        self.preview3d.set_target(target_physics)
-
     def set_workspace(self, r_max: float, L_rest: float, L_max: float, theta_max_rad: float) -> None:
-        self._L_rest = L_rest
-        self._L_max = L_max
-        self.xy_picker.set_r_max(r_max)
-        self.xz_picker.set_workspace(L_rest, L_max, theta_max_rad)
-        self.preview3d._L_max = L_max
-        self.preview3d._theta_max = theta_max_rad
-        self.preview3d._redraw()
-
-
-def _parse_float(s: str) -> Optional[float]:
-    try:
-        return float(s)
-    except (TypeError, ValueError):
-        return None
+        pass

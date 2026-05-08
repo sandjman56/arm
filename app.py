@@ -351,7 +351,6 @@ class ArmUI:
             on_start_zero=self._exp_start_zero,
             on_confirm_zero=self._exp_confirm_zero,
             on_rezero=self._exp_rezero,
-            on_reach=self._exp_reach,
             on_reach_basic=self._exp_reach_basic,
             on_reach_bending=self._exp_reach_bending,
             on_emergency_stop=self._exp_emergency_stop,
@@ -591,53 +590,6 @@ class ArmUI:
             self.experiment_panel.set_status("Re-zeroed at current rest pose")
         else:
             self.experiment_panel.set_status("Re-zero blocked — pressures not near rest")
-
-    def _exp_reach(self, target_display):
-        from experiment_controller import ExperimentMode
-        self.experiment_controller.mode = ExperimentMode.COMPLEX
-        # Translate target from display frame (zero-relative) to physics frame
-        # (base-relative). Display frame origin = (0, 0, L_rest).
-        tx, ty, tz = target_display
-        target_physics = (tx, ty, tz + self.length_cal.L_rest)
-        # Operator-supplied per-module pressure ceiling (absolute psi). The
-        # controller clamps every SET command to this value.
-        from tkinter import simpledialog
-        ceiling = simpledialog.askfloat(
-            "Reach — Pressure Ceiling",
-            "Max per-module pressure (psi absolute):",
-            parent=self.root, minvalue=14.0, maxvalue=25.0, initialvalue=18.0,
-        )
-        if ceiling is None:
-            self.experiment_panel.set_status("Reach cancelled (no ceiling)")
-            return
-        # Latch the servo defaults from the burst panel's current slider state
-        # so the bend controller composes its offsets on top of known angles,
-        # never a stale/random read.
-        try:
-            servo_defaults = {
-                sid: int(self.burst_panel._servo_vars[sid - 1].get())
-                for sid in (1, 2, 3, 4)
-            }
-        except (AttributeError, IndexError):
-            servo_defaults = None
-        try:
-            self.experiment_controller.reach(
-                target_physics,
-                servo_defaults=servo_defaults,
-                pressure_ceiling_psi=ceiling,
-            )
-            self.experiment_panel.set_status(
-                f"Reaching toward {target_display} (≤{ceiling:.1f} psi)"
-            )
-            self.experiment_panel.set_target_marker(target_physics)
-        except ValueError as e:
-            self.experiment_panel.set_status(f"Rejected: {e}")
-            return
-        if not self.logger.is_active:
-            self.start_log(prefix="Complex")
-            self._exp_auto_logging = True
-        self._exp_prev_state = self.experiment_controller.state
-        self._exp_prev_connected = bool(self.arduino.ser and self.arduino.ser.is_open)
 
     def _exp_reach_basic(self, z_target_mm: float, psi_threshold: float,
                          speed_scale: float):
@@ -1156,10 +1108,6 @@ class ArmUI:
                     theta_imu_deg=theta_deg,
                     pull_deg=self.experiment_controller._bend_pull_deg,
                 )
-            # Pass tip in display frame (picker rendering) and arc in physics
-            # frame (preview rendering). Panel handles the frame split.
-            arc_pts_base = _sample_arc_points(s.total_length_mm, theta_now, phi_now, n=20)
-            self.experiment_panel.set_tip_position(tip_zero, arc_pts_base)
             # Light/dim each module's stepper-activity dot based on whether
             # its reported position changed within the active window.
             import time as _time_mod
@@ -1358,7 +1306,3 @@ class ArmUI:
         self.root.destroy()
 
 
-def _sample_arc_points(L: float, theta: float, phi: float, n: int = 20):
-    """Sample n+1 points along the PCC arc from base to tip."""
-    from kinematics import forward_kinematics
-    return [forward_kinematics(L * i / n, theta * i / n, phi) for i in range(n + 1)]
