@@ -25,7 +25,6 @@ def test_panel_instantiates_offline():
         on_start_zero=lambda: None,
         on_confirm_zero=lambda: None,
         on_rezero=lambda: None,
-        on_reach=lambda t: None,
         on_reach_basic=lambda z, t, s: None,
         on_emergency_stop=lambda: None,
     )
